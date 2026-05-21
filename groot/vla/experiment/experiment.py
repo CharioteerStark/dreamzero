@@ -13,6 +13,12 @@ from groot.vla.utils.action_args_override_utils import apply_action_overrides
 
 logger = logging.getLogger(__name__)
 
+if os.environ.get("GPU_MEM_FRACTION"):
+    _frac = float(os.environ["GPU_MEM_FRACTION"])
+    for _i in range(torch.cuda.device_count()):
+        torch.cuda.set_per_process_memory_fraction(_frac, device=_i)
+    logger.info("Capped per-process CUDA memory fraction to %.2f on %d device(s)", _frac, torch.cuda.device_count())
+
 
 INITIAL_ACTIONS_FILENAME = "initial_actions.npz"
 

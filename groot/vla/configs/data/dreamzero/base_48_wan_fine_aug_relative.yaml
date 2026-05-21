@@ -343,6 +343,90 @@ transform_yam:
 
 
 ################################################################################
+# adam (custom bimanual ~14-DoF robot, state 14 dims, action 14 dims, 3 views:
+#       top + left_wrist + right_wrist; layout mirrors YAM for AgiBot transfer.
+#       Cameras keep the same [top, left_wrist, right_wrist] order as YAM.)
+################################################################################
+
+modality_config_adam:
+  video:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    eval_delta_indices: [0]
+    modality_keys:
+      - video.top
+      - video.left_wrist
+      - video.right_wrist
+  state:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - state.left_joint_pos
+      - state.left_gripper_pos
+      - state.right_joint_pos
+      - state.right_gripper_pos
+  action:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    modality_keys:
+      - action.left_joint_pos
+      - action.left_gripper_pos
+      - action.right_joint_pos
+      - action.right_gripper_pos
+  language:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - annotation.task
+
+transform_adam:
+  _target_: groot.vla.data.transform.ComposedModalityTransform
+  transforms:
+    # Video transforms
+    - <<: *totensor_cfg
+      apply_to: ${modality_config_adam.video.modality_keys}
+    - <<: *crop_cfg
+      apply_to: ${modality_config_adam.video.modality_keys}
+    - <<: *resize_cfg
+      apply_to: ${modality_config_adam.video.modality_keys}
+    - <<: *color_jitter_cfg
+      apply_to: ${modality_config_adam.video.modality_keys}
+    - <<: *to_numpy_cfg
+      apply_to: ${modality_config_adam.video.modality_keys}
+
+    # State transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_adam.state.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_adam.state.modality_keys}
+      normalization_modes:
+        state.left_joint_pos: q99
+        state.left_gripper_pos: q99
+        state.right_joint_pos: q99
+        state.right_gripper_pos: q99
+
+    # Action transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_adam.action.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_adam.action.modality_keys}
+      normalization_modes:
+        action.left_joint_pos: q99
+        action.left_gripper_pos: q99
+        action.right_joint_pos: q99
+        action.right_gripper_pos: q99
+
+    # ConcatTransform
+    - _target_: groot.vla.data.transform.ConcatTransform
+      video_concat_order: ${modality_config_adam.video.modality_keys}
+      state_concat_order: ${modality_config_adam.state.modality_keys}
+      action_concat_order: ${modality_config_adam.action.modality_keys}
+
+    # Model-specific transform
+    - ${model_specific_transform}
+
+
+################################################################################
 # Modality Configs
 ################################################################################
 
@@ -350,6 +434,7 @@ modality_configs:
   oxe_droid: ${modality_config_oxe_droid}
   agibot: ${modality_config_agibot}
   yam: ${modality_config_yam}
+  adam: ${modality_config_adam}
 
 ################################################################################
 # Transforms
@@ -359,6 +444,7 @@ transforms:
   oxe_droid: ${transform_oxe_droid}
   agibot: ${transform_agibot}
   yam: ${transform_yam}
+  adam: ${transform_adam}
 
 ################################################################################
 # Metadata Versions
@@ -368,6 +454,7 @@ metadata_versions:
   oxe_droid: '0221'
   agibot: '0221'
   yam: '0221'
+  adam: '0221'
 
 ################################################################################
 # FPS (per embodiment, null means use dataset default)
@@ -375,3 +462,4 @@ metadata_versions:
 
 fps:
   yam: 30
+  adam: 30
