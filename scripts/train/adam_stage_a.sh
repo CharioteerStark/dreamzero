@@ -6,11 +6,14 @@
 #   how its 14-D state/action maps to motion primitives, and how natural-language
 #   instructions tie to those motions. NOT a task-success stage.
 #
-# Recipe matches scripts/train/yam_training.sh (LoRA, 100k steps, bs=4 per device,
-# LR=1e-5, DeepSpeed zero2, save_lora_only=true). Only save_steps stays low so we
-# get frequent checkpoints early in training.
+# This MIRRORS scripts/train/yam_training.sh EXACTLY — same recipe YAM used for
+# embodiment adaptation. The only differences are embodiment-specific:
+#   data=dreamzero/adam_relative (vs yam_relative), adam_data_root (vs yam_data_root),
+#   and the output dir. Everything else (LoRA, zero2, bs=4, 100k steps, LR=1e-5,
+#   save_steps=10000, save_lora_only=true, from DreamZero-AgiBot, single dataset /
+#   no co-training mix) is identical to YAM.
 #
-# Reference: docs/STAGE_A_TO_B_PLAN.md §2; scripts/train/yam_training.sh
+# Reference: scripts/train/yam_training.sh; docs/STAGE_A_TO_B_PLAN.md §2
 #
 # Prerequisites:
 #   - Adam dataset converted via scripts/data/convert_lerobot_to_gear.py with
@@ -22,15 +25,19 @@
 
 export HYDRA_FULL_ERROR=1
 
-# Pin to the conda dreamzero env (pinned torch 2.8.0+cu129 / transformers 4.51.3 /
-# deepspeed 0.19.0 / peft 0.5.0 + nvcc). Use absolute paths so any active venv
-# (e.g. RLinf) cannot leak into PATH resolution.
+# Pin to the conda dreamzero env if it exists (keeps a stray venv from leaking into PATH).
+# On a VM with a different layout, set CONDA_ENV=/path/to/env, or leave it unset to fall
+# back to whatever `torchrun` is on PATH in the active environment (matches yam_training.sh).
 CONDA_ENV=${CONDA_ENV:-/home/thematrix/miniconda3/envs/dreamzero}
-TORCHRUN=$CONDA_ENV/bin/torchrun
-unset VIRTUAL_ENV
-export PATH="$CONDA_ENV/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export CONDA_PREFIX=$CONDA_ENV
-export CONDA_DEFAULT_ENV=dreamzero
+if [ -x "$CONDA_ENV/bin/torchrun" ]; then
+  TORCHRUN=$CONDA_ENV/bin/torchrun
+  unset VIRTUAL_ENV
+  export PATH="$CONDA_ENV/bin:$PATH"
+  export CONDA_PREFIX=$CONDA_ENV
+  export CONDA_DEFAULT_ENV=$(basename "$CONDA_ENV")
+else
+  TORCHRUN=torchrun
+fi
 
 # ============ CHANGE THESE VARIABLES ============
 # Dataset path (Adam in LeRobot v2 + GEAR metadata format).
@@ -49,12 +56,12 @@ NUM_GPUS=${NUM_GPUS:-8}
 WAN_CKPT_DIR=${WAN_CKPT_DIR:-"./checkpoints/Wan2.1-I2V-14B-480P"}
 TOKENIZER_DIR=${TOKENIZER_DIR:-"./checkpoints/umt5-xxl"}
 
-# Base pretrained checkpoint to fine-tune from.
+# Base pretrained checkpoint to fine-tune from (same as YAM).
 PRETRAINED_MODEL_PATH=${PRETRAINED_MODEL_PATH:-"./checkpoints/DreamZero-AgiBot"}
 
-# Training budget — matches yam_training.sh except SAVE_STEPS (kept low for frequent checkpoints).
+# Training budget — identical to yam_training.sh.
 MAX_STEPS=${MAX_STEPS:-100000}
-SAVE_STEPS=${SAVE_STEPS:-1000}
+SAVE_STEPS=${SAVE_STEPS:-10000}
 SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-10}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 PER_DEVICE_BS=${PER_DEVICE_BS:-4}
