@@ -158,8 +158,8 @@ class EmbodimentTag(Enum):
     ADAM = "adam"
     """
     Custom bimanual ~14-DoF robot (2x 6-DoF arms + 2 grippers) with 3 fixed cameras
-    (top, left_wrist, right_wrist). Used for two-stage post-training of DreamZero-AgiBot:
-    Stage A embodiment LoRA, Stage B unseen-task LoRA. See docs/STAGE_A_TO_B_PLAN.md.
+    (top, left_wrist, right_wrist). Used for embodiment-adaptation LoRA post-training
+    of DreamZero-AgiBot. See docs/STAGE_A_PLAN.md.
     """
 
     DREAM = "dream"

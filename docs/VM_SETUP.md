@@ -180,21 +180,23 @@ checkpoints/
 
 ## Quick Smoke Test
 
-Run the Adam inference server against a test checkpoint (replace path as needed):
+Verify the model + transform pipeline without any robot hardware or websocket
+server. This runs the policy offline against frames from the dataset and reports
+predicted-vs-ground-truth action MSE:
 
 ```bash
 cd ~/tony/dreamzero
-bash scripts/inference/serve_wam.sh \
-    ./checkpoints/DreamZero-AgiBot 5000 2 0,1
+CUDA_VISIBLE_DEVICES=0 CUDA_HOME=$CONDA_PREFIX python scripts/open_loop_adam.py \
+    --model_path ./checkpoints/adam_stage_a_lora/checkpoint-XXXX \
+    --dataset_path ./data \
+    --num_samples 60 --use_dataset_prompt
 ```
 
-In a second terminal:
-```bash
-cd ~/tony/dreamzero
-python test_client_AR.py --port 5000
-```
+Healthy output: `*_joint_pos` MSE ≲ 0.01 rad². (Gripper MSE may stay high until the
+gripper head converges — see `docs/STAGE_A_PLAN.md` §6.) First inference takes a few
+minutes to warm up; ~3s/sample on H100 thereafter.
 
-First few inferences take a few minutes to warm up. After warm-up: ~3s on H100, ~0.6s on GB200.
+For real-robot inference (server + arms), see [`../INFERENCE_COMMANDS.md`](../INFERENCE_COMMANDS.md).
 
 ---
 
@@ -219,9 +221,10 @@ From there you can ask Claude to help with training scripts, dataset conversion,
 | `checkpoints/DreamZero-AgiBot` | Base checkpoint for Adam fine-tuning |
 | `checkpoints/Wan2.1-I2V-14B-480P` | WAN video backbone weights |
 | `checkpoints/umt5-xxl` | Text tokenizer |
-| `scripts/train/adam_stage_a.sh` | Stage A LoRA launch (mirrors `yam_training.sh`: 100k steps, bs=4, save_lora_only) |
-| `scripts/train/adam_stage_b.sh` | Stage B task-specific LoRA launch |
+| `scripts/train/adam_stage_a.sh` | Stage A embodiment LoRA launch (mirrors `yam_training.sh`: 100k steps, bs=4, save_lora_only) |
 | `scripts/inference/serve_wam.sh` | WAM (Adam) inference server launcher |
-| `scripts/open_loop_adam.py` | Offline open-loop checker for Stage A — runs the model without the websocket server |
-| `docs/STAGE_A_TO_B_PLAN.md` | Two-stage fine-tune plan |
+| `deploy_adam.py` | Real-robot client — ZED cameras + xArm state → server → xArm commands |
+| `scripts/open_loop_adam.py` | Offline open-loop checker — runs the model without the websocket server |
+| `docs/STAGE_A_PLAN.md` | Stage A embodiment-adaptation plan |
+| `INFERENCE_COMMANDS.md` | Real-robot inference commands (serve_wam + deploy_adam) |
 | `docs/DATASET_TO_GEAR_AND_TRAIN.md` | New embodiment onboarding guide |

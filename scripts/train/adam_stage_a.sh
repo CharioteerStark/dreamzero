@@ -13,7 +13,7 @@
 #   save_steps=10000, save_lora_only=true, from DreamZero-AgiBot, single dataset /
 #   no co-training mix) is identical to YAM.
 #
-# Reference: scripts/train/yam_training.sh; docs/STAGE_A_TO_B_PLAN.md §2
+# Reference: scripts/train/yam_training.sh; docs/STAGE_A_PLAN.md §2
 #
 # Prerequisites:
 #   - Adam dataset converted via scripts/data/convert_lerobot_to_gear.py with

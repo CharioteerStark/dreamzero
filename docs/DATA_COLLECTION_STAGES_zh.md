@@ -2,7 +2,7 @@
 
 > 本文档说明 **遥操作数据采集团队** 在两个微调阶段分别需要采集**什么数据**、**采多少**、**怎样标注**。两阶段共同遵循的 LeRobot v2 交付格式参见 [`DATA_COLLECTION_REQUIREMENTS_zh.md`](DATA_COLLECTION_REQUIREMENTS_zh.md);本文件只描述**内容层面**的差异。
 >
-> 训练侧总体流程见 [`STAGE_A_TO_B_PLAN.md`](STAGE_A_TO_B_PLAN.md)。
+> 训练侧总体流程见 [`STAGE_A_PLAN.md`](STAGE_A_PLAN.md)。
 
 ---
 

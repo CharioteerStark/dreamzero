@@ -1,7 +1,8 @@
-"""Merge a DreamZero Stage A LoRA checkpoint into its dense base.
+"""Merge a DreamZero LoRA checkpoint into its dense base.
 
-Produces a dense safetensors checkpoint suitable as `pretrained_model_path` for
-Stage B (`scripts/train/adam_stage_b.sh`).
+Produces a dense safetensors checkpoint suitable as a `pretrained_model_path`
+(e.g. to fold an embodiment-adaptation LoRA back into a dense base before further
+training or deployment).
 
 This is a pure state-dict merge — no model instantiation, no GPU required.
 
