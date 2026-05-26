@@ -39,6 +39,8 @@ class Args:
     enable_dit_cache: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
+    embodiment: str = "oxe_droid"  # "oxe_droid" (DROID single-arm) or "adam" (bimanual 14-DoF)
+    default_prompt: str = ""  # Used by Adam when the client sends an empty prompt
 
 
 class ARDroidRoboarenaPolicy:
@@ -352,9 +354,246 @@ class ARDroidRoboarenaPolicy:
     
     def reset(self, reset_info: dict) -> None:
         """Reset the policy state for a new episode.
-        
+
         Clears frame buffers and resets call count.
         """
+        self._reset_state(save_video=True)
+
+
+class AdamRoboarenaPolicy:
+    """Wrapper policy for the Adam bimanual robot (2x 6-DoF arms + 2 grippers, 14-dim actions).
+
+    Maps the roboarena observation/action schema (designed around DROID single-arm)
+    to Adam's bimanual training schema:
+
+      Observation (roboarena -> Adam training keys):
+        observation/exterior_image_0_left -> video.top
+        observation/exterior_image_1_left -> video.left_wrist
+        observation/wrist_image_left      -> video.right_wrist
+        observation/joint_position (12,)  -> state.left_joint_pos (1,6) | state.right_joint_pos (1,6)
+        observation/gripper_position (2,) -> state.left_gripper_pos (1,1) | state.right_gripper_pos (1,1)
+        prompt                            -> annotation.task
+
+      Action (Adam training keys -> flat array):
+        action.left_joint_pos (N,6) + action.left_gripper_pos (N,1) +
+        action.right_joint_pos (N,6) + action.right_gripper_pos (N,1) -> (N, 14)
+
+    Adam uses eval_delta_indices=[0]: a single current frame per call. Temporal
+    context is provided by the WAN DiT's KV cache (enabled via --enable-dit-cache).
+    """
+
+    # Adam evaluates with a single current frame; no multi-frame accumulation needed.
+    FRAMES_PER_CHUNK = 1
+
+    def __init__(
+        self,
+        groot_policy: GrootSimPolicy,
+        signal_group: dist.ProcessGroup,
+        output_dir: str | None = None,
+        default_prompt: str = "",
+    ) -> None:
+        self._policy = groot_policy
+        self._signal_group = signal_group
+        self._output_dir = output_dir
+        self._default_prompt = default_prompt
+
+        self._current_session_id: str | None = None
+        self.video_across_time = []
+        self._msg_index = 0
+
+        if self._output_dir:
+            os.makedirs(self._output_dir, exist_ok=True)
+
+    def _convert_observation(self, obs: dict) -> dict:
+        converted: dict = {}
+
+        # Camera mapping: roboarena order -> Adam training keys.
+        image_key_mapping = {
+            "observation/exterior_image_0_left": "video.top",
+            "observation/exterior_image_1_left": "video.left_wrist",
+            "observation/wrist_image_left":      "video.right_wrist",
+        }
+        for roboarena_key, adam_key in image_key_mapping.items():
+            frame = obs.get(roboarena_key)
+            if frame is None:
+                continue
+            if not isinstance(frame, np.ndarray):
+                frame = np.asarray(frame)
+            if frame.ndim == 3:
+                # Single (H, W, 3) -> add leading time dim to get (1, H, W, 3)
+                converted[adam_key] = frame[np.newaxis]
+            else:
+                # Already (T, H, W, 3) -> take the last frame, keep time dim
+                converted[adam_key] = frame[-1:, ...]
+
+        # State: 12 joint values (6 left + 6 right) and 2 gripper values (left, right).
+        joint_pos = obs.get("observation/joint_position")
+        if joint_pos is None:
+            joint_pos = np.zeros(12, dtype=np.float64)
+        else:
+            joint_pos = np.asarray(joint_pos, dtype=np.float64).reshape(-1)
+
+        gripper_pos = obs.get("observation/gripper_position")
+        if gripper_pos is None:
+            gripper_pos = np.zeros(2, dtype=np.float64)
+        else:
+            gripper_pos = np.asarray(gripper_pos, dtype=np.float64).reshape(-1)
+
+        if joint_pos.size < 12:
+            joint_pos = np.pad(joint_pos, (0, 12 - joint_pos.size))
+        if gripper_pos.size < 2:
+            gripper_pos = np.pad(gripper_pos, (0, 2 - gripper_pos.size))
+
+        converted["state.left_joint_pos"]    = joint_pos[0:6].reshape(1, 6)
+        converted["state.right_joint_pos"]   = joint_pos[6:12].reshape(1, 6)
+        converted["state.left_gripper_pos"]  = gripper_pos[0:1].reshape(1, 1)
+        converted["state.right_gripper_pos"] = gripper_pos[1:2].reshape(1, 1)
+
+        # Language: Adam uses annotation.task (not annotation.language.action_text).
+        prompt = obs.get("prompt") or self._default_prompt
+        converted["annotation.task"] = prompt
+
+        return converted
+
+    def _convert_action(self, action_dict: dict) -> np.ndarray:
+        """Concatenate Adam's 4 action tensors into a flat (N, 14) array.
+
+        Order matches the training-time ConcatTransform action_concat_order:
+        left_joint_pos (6) + left_gripper_pos (1) + right_joint_pos (6) + right_gripper_pos (1).
+        """
+        keys_in_order = [
+            "action.left_joint_pos",
+            "action.left_gripper_pos",
+            "action.right_joint_pos",
+            "action.right_gripper_pos",
+        ]
+
+        parts: list[np.ndarray] = []
+        N: int | None = None
+        for key in keys_in_order:
+            v = action_dict.get(key)
+            if v is None:
+                parts.append(None)  # placeholder; filled below once N is known
+                continue
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().numpy()
+            v = np.asarray(v)
+            if v.ndim == 1:
+                v = v.reshape(-1, 1)
+            elif v.ndim == 0:
+                v = v.reshape(1, 1)
+            parts.append(v)
+            if N is None:
+                N = v.shape[0]
+
+        if N is None:
+            return np.zeros((1, 14), dtype=np.float32)
+
+        expected_dims = {
+            "action.left_joint_pos": 6,
+            "action.left_gripper_pos": 1,
+            "action.right_joint_pos": 6,
+            "action.right_gripper_pos": 1,
+        }
+        filled: list[np.ndarray] = []
+        for key, part in zip(keys_in_order, parts):
+            if part is None:
+                filled.append(np.zeros((N, expected_dims[key]), dtype=np.float32))
+            else:
+                filled.append(part)
+
+        return np.concatenate(filled, axis=-1).astype(np.float32)
+
+    def _broadcast_batch_to_workers(self, obs: dict) -> None:
+        """Broadcast batch data from rank 0 to all other ranks (matches DROID wrapper)."""
+        import pickle
+
+        serialized = pickle.dumps(obs)
+        size_tensor = torch.tensor([len(serialized)], dtype=torch.int64, device='cuda')
+        dist.broadcast(size_tensor, src=0)
+
+        data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
+        dist.broadcast(data_tensor, src=0)
+
+    def infer(self, obs: dict) -> np.ndarray:
+        # Session change -> reset state (saves video on reset if output_dir set).
+        session_id = obs.get("session_id", None)
+        if session_id is not None and session_id != self._current_session_id:
+            if self._current_session_id is not None:
+                logger.info(
+                    f"Session changed from '{self._current_session_id}' to '{session_id}', resetting state"
+                )
+                self._reset_state()
+            else:
+                logger.info(f"New session started: '{session_id}'")
+            self._current_session_id = session_id
+
+        self._msg_index += 1
+
+        converted_obs = self._convert_observation(obs)
+
+        # Signal workers to continue (0 = continue).
+        signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
+        dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+
+        # Broadcast obs to workers and run the distributed forward pass.
+        self._broadcast_batch_to_workers(converted_obs)
+
+        batch = Batch(obs=converted_obs)
+        dist.barrier()
+        with torch.no_grad():
+            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+        dist.barrier()
+
+        self.video_across_time.append(video_pred)
+
+        action_chunk_dict = result_batch.act
+        action_dict: dict = {}
+        for k in dir(action_chunk_dict):
+            if k.startswith("action."):
+                action_dict[k] = getattr(action_chunk_dict, k)
+
+        return self._convert_action(action_dict)
+
+    def _reset_state(self, save_video: bool = True) -> None:
+        if save_video and len(self.video_across_time) > 0 and self._output_dir:
+            try:
+                video_across_time_cat = torch.cat(self.video_across_time, dim=2)
+                frames = self._policy.trained_model.action_head.vae.decode(
+                    video_across_time_cat,
+                    tiled=self._policy.trained_model.action_head.tiled,
+                    tile_size=(
+                        self._policy.trained_model.action_head.tile_size_height,
+                        self._policy.trained_model.action_head.tile_size_width,
+                    ),
+                    tile_stride=(
+                        self._policy.trained_model.action_head.tile_stride_height,
+                        self._policy.trained_model.action_head.tile_stride_width,
+                    ),
+                )
+                frames = rearrange(frames, "B C T H W -> B T H W C")
+                frames = frames[0]
+                frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+                frame_list = [f for f in frames]
+
+                if len(frame_list) > 0:
+                    save_dir = self._output_dir
+                    os.makedirs(save_dir, exist_ok=True)
+                    all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
+                    timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
+                    n = (len(frame_list) - 1) // 8
+                    output_path = os.path.join(
+                        save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4'
+                    )
+                    imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
+                    logger.info(f"Saved video on reset to: {output_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save video on reset: {e}")
+
+        self.video_across_time = []
+
+    def reset(self, reset_info: dict) -> None:
+        """Reset the policy state for a new episode."""
         self._reset_state(save_video=True)
 
 
@@ -748,7 +987,7 @@ def main(args: Args) -> None:
     # to autoregressive nature of the model (several possible shapes).
     torch._dynamo.config.recompile_limit = 800
 
-    embodiment_tag = "oxe_droid"
+    embodiment_tag = args.embodiment
     model_path = args.model_path
     policy_metadata = {
         "embodiment": embodiment_tag,
@@ -788,12 +1027,21 @@ def main(args: Args) -> None:
         output_dir = None
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
     
-    # Create wrapper policy that converts between roboarena and AR_droid formats
-    wrapper_policy = ARDroidRoboarenaPolicy(
-        groot_policy=policy,
-        signal_group=signal_group,
-        output_dir=output_dir,
-    )
+    # Create wrapper policy that converts between roboarena and the training schema
+    # for the selected embodiment.
+    if args.embodiment == "adam":
+        wrapper_policy = AdamRoboarenaPolicy(
+            groot_policy=policy,
+            signal_group=signal_group,
+            output_dir=output_dir,
+            default_prompt=args.default_prompt,
+        )
+    else:
+        wrapper_policy = ARDroidRoboarenaPolicy(
+            groot_policy=policy,
+            signal_group=signal_group,
+            output_dir=output_dir,
+        )
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
     server_config = PolicyServerConfig(

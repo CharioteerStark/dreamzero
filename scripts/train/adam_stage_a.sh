@@ -1,15 +1,16 @@
 #!/bin/bash
-# DreamZero Adam — Stage A: Embodiment Adaptation (Full Fine-Tune of DreamZero-AgiBot)
+# DreamZero Adam — Stage A: Embodiment Adaptation (LoRA of DreamZero-AgiBot)
 #
 # Purpose:
 #   Teach the model how the Adam robot (14-DoF bimanual, 3 cameras) moves,
 #   how its 14-D state/action maps to motion primitives, and how natural-language
 #   instructions tie to those motions. NOT a task-success stage.
 #
-# Paper-aligned (§4.2): all parameters trained except text encoder, image encoder, VAE.
-# Use Full-FT when GPU/disk budget allows; otherwise see git history for the LoRA variant.
+# Recipe matches scripts/train/yam_training.sh (LoRA, 100k steps, bs=4 per device,
+# LR=1e-5, DeepSpeed zero2, save_lora_only=true). Only save_steps stays low so we
+# get frequent checkpoints early in training.
 #
-# Reference: docs/STAGE_A_TO_B_PLAN.md §2, §3 note; scripts/train/droid_training_full_finetune_wan21.sh
+# Reference: docs/STAGE_A_TO_B_PLAN.md §2; scripts/train/yam_training.sh
 #
 # Prerequisites:
 #   - Adam dataset converted via scripts/data/convert_lerobot_to_gear.py with
@@ -31,20 +32,14 @@ export PATH="$CONDA_ENV/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 export CONDA_PREFIX=$CONDA_ENV
 export CONDA_DEFAULT_ENV=dreamzero
 
-# Cap per-process CUDA memory to leave headroom for concurrent inference (e.g. pi-0.5 VLA).
-# Default 0.90 -> 14B Full-FT needs nearly all GPU memory (params + grads + AdamW state).
-# Lower (e.g. 0.70) if you must co-locate inference; raise to 0.95 if dedicated training box.
-# Per-GPU footprint at 0.90: ~86 GB on RTX PRO 6000 (96 GB), ~127 GB on H200 (141 GB).
-export GPU_MEM_FRACTION=${GPU_MEM_FRACTION:-0.90}
-
 # ============ CHANGE THESE VARIABLES ============
 # Dataset path (Adam in LeRobot v2 + GEAR metadata format).
 ADAM_DATA_ROOT=${ADAM_DATA_ROOT:-"./data"}
 
-# Output directory for Stage A Full-FT checkpoints (~30 GB each — keep save_total_limit low).
-OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints/adam_stage_a_full"}
+# Output directory for Stage A LoRA checkpoints (~200 MB each with save_lora_only=true).
+OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints/adam_stage_a_lora"}
 
-# Number of GPUs (default: all visible GPUs; recommend 8× H200/B200 NVLink for 14B Full-FT).
+# Number of GPUs (default: all visible GPUs).
 if [ -z "${NUM_GPUS}" ]; then
   NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 fi
@@ -57,19 +52,13 @@ TOKENIZER_DIR=${TOKENIZER_DIR:-"./checkpoints/umt5-xxl"}
 # Base pretrained checkpoint to fine-tune from.
 PRETRAINED_MODEL_PATH=${PRETRAINED_MODEL_PATH:-"./checkpoints/DreamZero-AgiBot"}
 
-# Stage A training budget (paper: small, fast — ~30 min wall-clock of data,
-# ~5k steps in our setup is enough to capture embodiment without overfitting).
-# Full-FT has higher overfitting risk than LoRA on 30–60 min of data: keep MAX_STEPS conservative
-# and monitor val loss — early-stop if it diverges from train loss.
-MAX_STEPS=${MAX_STEPS:-5000}
+# Training budget — matches yam_training.sh except SAVE_STEPS (kept low for frequent checkpoints).
+MAX_STEPS=${MAX_STEPS:-100000}
 SAVE_STEPS=${SAVE_STEPS:-1000}
-SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-3}
+SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-10}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
-PER_DEVICE_BS=${PER_DEVICE_BS:-1}
-# DeepSpeed config. zero2_offload = ZeRO-2 + CPU optimizer offload (matches the project's
-# reference full-FT script). Switch to zero2 if your VRAM allows (faster, no CPU traffic),
-# or zero3 if you need to further shard params (slowest comms, lowest VRAM).
-DEEPSPEED_CFG=${DEEPSPEED_CFG:-zero2_offload}
+PER_DEVICE_BS=${PER_DEVICE_BS:-4}
+DEEPSPEED_CFG=${DEEPSPEED_CFG:-zero2}
 # ================================================
 
 # ============ AUTO-DOWNLOAD WEIGHTS ============
@@ -107,7 +96,7 @@ $TORCHRUN --nproc_per_node $NUM_GPUS --standalone groot/vla/experiment/experimen
     report_to=wandb \
     data=dreamzero/adam_relative \
     wandb_project=dreamzero \
-    train_architecture=full \
+    train_architecture=lora \
     num_frames=33 \
     action_horizon=24 \
     num_views=3 \
@@ -131,11 +120,11 @@ $TORCHRUN --nproc_per_node $NUM_GPUS --standalone groot/vla/experiment/experimen
     bf16=true \
     tf32=true \
     eval_bf16=true \
-    dataloader_pin_memory=true \
-    dataloader_num_workers=4 \
+    dataloader_pin_memory=false \
+    dataloader_num_workers=1 \
     image_resolution_width=320 \
     image_resolution_height=176 \
-    save_lora_only=false \
+    save_lora_only=true \
     max_chunk_size=4 \
     frame_seqlen=880 \
     save_strategy=steps \
@@ -146,4 +135,5 @@ $TORCHRUN --nproc_per_node $NUM_GPUS --standalone groot/vla/experiment/experimen
     vae_pretrained_path=$WAN_CKPT_DIR/Wan2.1_VAE.pth \
     tokenizer_path=$TOKENIZER_DIR \
     pretrained_model_path=$PRETRAINED_MODEL_PATH \
-    ++action_head_cfg.config.skip_component_loading=true
+    ++action_head_cfg.config.skip_component_loading=true \
+    ++action_head_cfg.config.defer_lora_injection=true

@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 wandb/
 
+# Open-loop evaluation artifacts (e.g. scripts/open_loop_adam.py output)
+/results_*/
+
 # C extensions
 
 
