@@ -1044,12 +1044,17 @@ def main(args: Args) -> None:
         )
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
+    if args.embodiment == "adam":
+        img_res = (360, 640)  # Adam trained at 640x360
+    else:
+        img_res = (360, 640)  # model trained at 640x360
+
     server_config = PolicyServerConfig(
-        image_resolution=(180, 320),  # AR_droid expects 180x320 images
+        image_resolution=img_res,
         needs_wrist_camera=True,
         n_external_cameras=2,
         needs_stereo_camera=False,
-        needs_session_id=True,  # Track session to reset state for new clients
+        needs_session_id=True,
         action_space="joint_position",
     )
     

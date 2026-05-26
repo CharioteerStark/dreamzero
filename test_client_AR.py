@@ -11,7 +11,7 @@ Frame schedule (matching debug_inference.py):
   - ...
 
 Expected server configuration:
-    - image_resolution: (180, 320)
+    - image_resolution: (360, 640)
     - n_external_cameras: 2
     - needs_wrist_camera: True
     - action_space: "joint_position"
@@ -68,8 +68,12 @@ def load_all_frames(video_path: str) -> np.ndarray:
     return np.stack(frames, axis=0)
 
 
-def load_camera_frames() -> dict[str, np.ndarray]:
+def load_camera_frames(target_hw: tuple[int, int] | None = None) -> dict[str, np.ndarray]:
     """Load all video frames for each camera from the debug_image/ directory.
+
+    Args:
+        target_hw: Optional (H, W) to resize frames to. If None, frames are
+                   returned at their native resolution.
 
     Returns:
         Dict mapping roboarena camera keys to (N, H, W, 3) uint8 arrays.
@@ -77,7 +81,14 @@ def load_camera_frames() -> dict[str, np.ndarray]:
     camera_frames: dict[str, np.ndarray] = {}
     for cam_key, fname in CAMERA_FILES.items():
         path = os.path.join(VIDEO_DIR, fname)
-        camera_frames[cam_key] = load_all_frames(path)
+        frames = load_all_frames(path)
+        if target_hw is not None:
+            th, tw = target_hw
+            if frames.shape[1] != th or frames.shape[2] != tw:
+                frames = np.stack(
+                    [cv2.resize(f, (tw, th)) for f in frames], axis=0
+                )
+        camera_frames[cam_key] = frames
         logging.info(f"Loaded {cam_key}: {camera_frames[cam_key].shape}")
     return camera_frames
 
@@ -237,7 +248,8 @@ def test_ar_droid_policy_server(
 
     # ── Real video frame mode ─────────────────────────────────────────
     logging.info("Loading real video frames from debug_image/ directory")
-    camera_frames = load_camera_frames()
+    target_hw = tuple(server_config.image_resolution) if server_config.image_resolution else None
+    camera_frames = load_camera_frames(target_hw=target_hw)
 
     total_frames = min(v.shape[0] for v in camera_frames.values())
     logging.info(f"Total frames available: {total_frames}")
@@ -278,8 +290,8 @@ def _log_action(actions: np.ndarray, dt: float) -> None:
     """Pretty-print action shape, range, and timing."""
     assert isinstance(actions, np.ndarray), f"Expected numpy array, got {type(actions)}"
     assert actions.ndim == 2, f"Expected 2D array, got shape {actions.shape}"
-    assert actions.shape[-1] == 8, (
-        f"Expected 8 action dims (7 joints + 1 gripper), got {actions.shape[-1]}"
+    assert actions.shape[-1] in (8, 14), (
+        f"Expected 8 or 14 action dims, got {actions.shape[-1]}"
     )
     logging.info(
         f"  Action shape: {actions.shape}, "
