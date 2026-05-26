@@ -80,26 +80,52 @@ Adjust the index ranges if your 14-D vector is laid out differently (e.g. `[left
 
 ### 2.4 Train Stage A LoRA
 
-`scripts/train/myrobot_stage_a.sh` overrides on top of `yam_training.sh`:
+`scripts/train/adam_stage_a.sh` (which `scripts/train/myrobot_stage_a.sh` should copy) inherits **YAM's recipe verbatim** except for `save_steps` (kept low for frequent early checkpoints):
 
 ```
 output_dir=./checkpoints/myrobot_stage_a_lora
 pretrained_model_path=./checkpoints/DreamZero-AgiBot
-max_steps=5000
-save_steps=1000
-save_total_limit=3
-per_device_train_batch_size=1
+train_architecture=lora
+max_steps=100000                # matches yam_training.sh
+save_steps=1000                 # lower than YAM's 10000 — useful for early-stage debugging
+save_total_limit=10
+per_device_train_batch_size=4
 training_args.learning_rate=1e-5
+training_args.deepspeed=groot/vla/configs/deepspeed/zero2.json
+dataloader_pin_memory=false
+dataloader_num_workers=1
 save_lora_only=true
+++action_head_cfg.config.skip_component_loading=true
+++action_head_cfg.config.defer_lora_injection=true
 ```
 
-With 3× RTX PRO 6000 (96 GB each) set `NUM_GPUS=3`. Keep `save_lora_only=true` to keep checkpoints small (~50 MB each); we run an explicit merge step before Stage B.
+> **Why 100k steps and not 5k?** The first Adam attempt used `max_steps=5000, batch_size=1` (5k effective sample-updates) and the gripper output head collapsed to a per-head constant ≈ the training mean — joint MSE 0.001–0.004 rad², gripper MSE 268 (left) / 2.5 (right). YAM uses 400k effective sample-updates (100k × bs=4) — ~80× more gripper signal — which is empirically enough for the gripper head to absorb the absolute→relative semantic flip that `relative_action_keys` introduces. See §8.
+>
+> If your dataset is much smaller than YAM's, you can lower `max_steps` proportionally, but keep `per_device_train_batch_size=4` and the LR.
+
+With 3× RTX PRO 6000 (96 GB each) set `NUM_GPUS=3`. Keep `save_lora_only=true` to keep checkpoints small (~200 MB each); we run an explicit merge step before Stage B.
 
 ### 2.5 Stage A exit criteria
 
-1. **Smoke test (`max_steps=10`)** completes without errors — verifies data + embodiment registration.
+1. **Smoke test (`MAX_STEPS=10 bash scripts/train/myrobot_stage_a.sh`)** completes without errors — verifies data + embodiment registration.
 2. **Loss curve** — action MSE decreases monotonically across the first 1000 steps. Instant plateau ⇒ state/action dim mis-mapped or wrong `relative_action_keys`.
-3. **Behavioral check** — load Stage A LoRA into the inference server, issue **one of the Stage A training-set captions verbatim**, and confirm the trajectory is qualitatively correct in joint space. We are *not* yet checking task success — just that the policy moves the robot meaningfully toward the captioned target.
+3. **Quantitative open-loop check** — run `scripts/open_loop_adam.py` (or its embodiment-specific copy) on the Stage A checkpoint against held-out frames from the training dataset:
+
+   ```bash
+   python scripts/open_loop_adam.py \
+     --model_path ./checkpoints/myrobot_stage_a_lora/checkpoint-XXXX \
+     --dataset_path ./data/myrobot_stage_a_lerobot \
+     --num_samples 200 --stride 500
+   ```
+
+   Per-key MSE thresholds at the end of Stage A (rough, embodiment-dependent):
+
+   | Key | Healthy | Under-trained / mis-mapped |
+   |---|---|---|
+   | `*_joint_pos` | ≲ 0.01 rad² | ≳ 0.1 rad² → check `relative_action_keys` + state slicing |
+   | `*_gripper_pos` | ≲ (range)² × 1e−3 | stuck at training mean → keep training; if it plateaus, see §8 |
+
+4. **Behavioral check** — load Stage A LoRA into the inference server, issue **one of the Stage A training-set captions verbatim**, and confirm the trajectory is qualitatively correct in joint space. We are *not* yet checking task success — just that the policy moves the robot meaningfully toward the captioned target.
 
 ---
 
@@ -116,7 +142,7 @@ python scripts/utils/merge_lora.py \
 
 This script (new file, ~30 lines) loads the base model + the LoRA adapter, calls PEFT's `merge_and_unload()`, and writes the merged state-dict. The merged directory then serves as `pretrained_model_path` for Stage B.
 
-> **Note.** The paper's own post-training is **full-parameter** (`§4.2: "we update all parameters except the text encoder, image encoder, and VAE"`) and explicitly tried LoRA during pretraining with suboptimal results (footnote 7). Our two-stage LoRA pipeline is an engineering compromise for the 3-GPU box. If you have the disk/compute, switch Stage A to full-FT, skip the merge, and use the resulting checkpoint directly as Stage B's pretrained path.
+> **Note.** The paper's own post-training is **full-parameter** (`§4.2: "we update all parameters except the text encoder, image encoder, and VAE"`) and explicitly tried LoRA during pretraining with suboptimal results (footnote 7). Our two-stage LoRA pipeline is an engineering compromise for the 3-GPU box, but **Stage A's LoRA-100k recipe is the same one YAM uses** in `scripts/train/yam_training.sh`, and YAM has been validated on real robot. If you have the disk/compute, switch Stage A to full-FT, skip the merge, and use the resulting checkpoint directly as Stage B's pretrained path.
 
 ---
 
@@ -184,7 +210,7 @@ The server resolves the LoRA's `base_model_name_or_path` automatically; just ens
 
 | Decision | Default | Why you might change it |
 |---|---|---|
-| LoRA (rank 4) vs full-FT | LoRA both stages | Full-FT is paper-aligned but needs ~30 GB per checkpoint and longer training. Switch if Stage B underperforms or you have disk headroom |
+| LoRA (rank 4) vs full-FT | **LoRA both stages, YAM-aligned recipe** (`max_steps=100000, bs=4`) | Full-FT is paper-aligned but needs ~30 GB per checkpoint. Switch if Stage B underperforms or you have disk headroom. Do **not** shorten Stage A below ~50k effective sample-updates — see §8 (gripper convergence) |
 | Stage A budget | 30–60 min, 10–12 tasks | Push to 90 min if your tasks need bimanual coordination or precision (paper's YAM also covered insertion + folding) |
 | Stage B per-task budget | 10–40 hours of varied demos | Drop to 1–3 hours only if the target task is a mild object/pose variant of a Stage A primitive |
 | Stage B per task vs joint | One LoRA per task | Joint multi-task LoRA possible but untested in our setup; default to per-task |
@@ -198,6 +224,8 @@ The server resolves the LoRA's `base_model_name_or_path` automatically; just ens
 - `docs/DATASET_TO_GEAR_AND_TRAIN.md` — canonical single-stage recipe; both stages reuse it
 - `docs/DATA_COLLECTION_STAGES_zh.md` — data team's per-stage capture spec
 - `scripts/train/yam_training.sh` — template both stage scripts copy from
+- `scripts/train/adam_stage_a.sh` — concrete Adam Stage A launcher mirroring YAM
+- `scripts/open_loop_adam.py` — offline open-loop checker (no server); use for §2.5 quantitative exit criterion
 - `groot/vla/data/schema/lerobot.py` — Pydantic schema for `modality.json` validation
 - `groot/vla/experiment/base.py:703-734` — `pretrained_model_path` loading + deferred LoRA injection
 - `groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py:325-365` — what gets frozen vs trained
@@ -223,3 +251,4 @@ The server resolves the LoRA's `base_model_name_or_path` automatically; just ens
 - **State/action layout.** The example above splits 14-D as `[L-arm 6, L-grip 1, R-arm 6, R-grip 1]`. Confirm your robot's actual exposure before running `convert_lerobot_to_gear.py`.
 - **Language diversity.** Paper footnote 12 (p.17): single-string-per-task caused YAM transfer to plateau. Use 2–3 paraphrases per task in Stage A; one clear sentence per episode in Stage B.
 - **Idle frames.** The pretraining recipe filters idle actions; replicate this when delivering Stage A data or the embodiment LoRA will overfit to "do-nothing" frames.
+- **Gripper head convergence (slow).** `DreamZero-AgiBot`'s gripper output head was pretrained to emit **absolute** gripper values (its `relative_action_keys` covers joints/head/waist only, not effector). Both `yam_relative.yaml` and `adam_relative.yaml` *do* include gripper in `relative_action_keys`, which silently re-frames gripper as a state-anchored delta. The flow-matching head needs ≳ 50k effective sample-updates (e.g. 50k steps × bs=1 or 12.5k × bs=4) to absorb that semantic flip; below that, both gripper heads collapse to a per-head constant ≈ the training mean and `open_loop_adam.py` reports gripper MSE ~ (range)². YAM's 100k × bs=4 = 400k clears this threshold by a wide margin. If you must train shorter (small dataset, compute-bound), the cheap mitigation is to drop the two gripper keys from `relative_action_keys` so the gripper head retains the pretrain's absolute semantics.

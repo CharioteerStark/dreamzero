@@ -219,8 +219,9 @@ From there you can ask Claude to help with training scripts, dataset conversion,
 | `checkpoints/DreamZero-AgiBot` | Base checkpoint for Adam fine-tuning |
 | `checkpoints/Wan2.1-I2V-14B-480P` | WAN video backbone weights |
 | `checkpoints/umt5-xxl` | Text tokenizer |
-| `scripts/train/adam_stage_a.sh` | Stage A full fine-tune launch |
+| `scripts/train/adam_stage_a.sh` | Stage A LoRA launch (mirrors `yam_training.sh`: 100k steps, bs=4, save_lora_only) |
 | `scripts/train/adam_stage_b.sh` | Stage B task-specific LoRA launch |
 | `scripts/inference/serve_wam.sh` | WAM (Adam) inference server launcher |
+| `scripts/open_loop_adam.py` | Offline open-loop checker for Stage A — runs the model without the websocket server |
 | `docs/STAGE_A_TO_B_PLAN.md` | Two-stage fine-tune plan |
 | `docs/DATASET_TO_GEAR_AND_TRAIN.md` | New embodiment onboarding guide |
