@@ -24,23 +24,29 @@
 #   bash scripts/inference/serve_wam.sh [MODEL_PATH] [PORT] [N_GPUS] [CUDA_DEVICES]
 #
 # Examples:
-#   # 2-GPU tensor parallel (recommended; ~1.7x faster than 1-GPU)
-#   bash scripts/inference/serve_wam.sh \
-#       ./checkpoints/adam_stage_a_lora/checkpoint-5000 5000 2 0,1
+#   # Default: 2-GPU tensor parallel on GPUs 0,2 + fixed merged checkpoint (just run it)
+#   bash scripts/inference/serve_wam.sh
 #
-#   # 1-GPU
-#   bash scripts/inference/serve_wam.sh \
-#       ./checkpoints/adam_stage_a_lora/checkpoint-5000 5000 1 0
+#   # Explicit 2-GPU
+#   bash scripts/inference/serve_wam.sh ./checkpoints/adam_stage_a_merged_19000 5000 2 0,2
+#
+#   # 1-GPU fallback (e.g. to use cfg_scale=1.0, which is incompatible with TP)
+#   bash scripts/inference/serve_wam.sh ./checkpoints/adam_stage_a_merged_19000 5000 1 2
 
 set -euo pipefail
 
-MODEL_PATH="${1:-./checkpoints/adam_stage_a_lora/checkpoint-5000}"
+# Defaults: 2-GPU tensor parallel (~1.7x) on GPUs 0,2 (skip GPU 1), and the FIXED merged
+# checkpoint (LoRA merged into the correct DreamZero-AgiBot base). Override via positional args:
+#   serve_wam.sh [MODEL_PATH] [PORT] [N_GPUS] [CUDA_DEVICES]
+MODEL_PATH="${1:-./checkpoints/adam_stage_a_merged_19000}"
 PORT="${2:-5000}"
 N_GPUS="${3:-2}"
-CUDA_DEVICES="${4:-0,1}"
+CUDA_DEVICES="${4:-0,2}"
 
 # Default prompt drawn from data/meta/tasks.jsonl (overridable via env var).
 DEFAULT_PROMPT="${DEFAULT_PROMPT:-Pick up the yellow cube and place it on the pink circular pad.}"
+# Override the default save dir (./world_model_videos under the repo root) if needed.
+SAVE_VIDEO_DIR="${SAVE_VIDEO_DIR:-}"
 
 if [[ ! -d "$MODEL_PATH" ]]; then
     echo "Error: checkpoint directory not found: $MODEL_PATH" >&2
@@ -76,9 +82,13 @@ echo "  GPUs           : $N_GPUS (CUDA_VISIBLE_DEVICES=$CUDA_DEVICES)"
 echo "  Python         : $(command -v python)"
 echo "  Default prompt : $DEFAULT_PROMPT"
 echo "  Protocol       : openpi-style msgpack/websocket; clients must set chunk_size=24"
+echo "  World-model    : ${SAVE_VIDEO_DIR:-./world_model_videos (default)}"
 echo "=========================================="
 
 cd "$REPO_ROOT"
+
+EXTRA_ARGS=()
+[[ -n "$SAVE_VIDEO_DIR" ]] && EXTRA_ARGS+=(--save-video-dir "$SAVE_VIDEO_DIR")
 
 torchrun \
     --standalone \
@@ -87,4 +97,5 @@ torchrun \
     --port "$PORT" \
     --model-path "$MODEL_PATH" \
     --enable-dit-cache \
-    --default-prompt "$DEFAULT_PROMPT"
+    --default-prompt "$DEFAULT_PROMPT" \
+    "${EXTRA_ARGS[@]}"

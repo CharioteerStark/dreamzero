@@ -177,9 +177,9 @@ class WANPolicyHead(ActionHead):
         self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
         self.model_names = ['text_encoder']
 
-        self.num_inference_steps = 16 
-        self.seed = 1140
-        self.cfg_scale = 5.0
+        self.num_inference_steps = int(os.environ.get("WAM_NUM_INFERENCE_STEPS", 16))
+        self.seed = int(os.environ.get("WAM_SEED", 1140))
+        self.cfg_scale = float(os.environ.get("WAM_CFG_SCALE", 5.0))
         self.denoising_strength = 1.0
         self.sigma_shift = 5.0
         self.kv_cache1: KVCacheType | None = None
@@ -1028,7 +1028,12 @@ class WANPolicyHead(ActionHead):
                     align_corners=False,
                 ).reshape(b, c, t, target_h, target_w)
 
-        if self.language is None:
+        if getattr(self, "rollout_no_reset", False) and self.language is not None and self.current_start_frame != 0:
+            # Open-loop rollout mode (opt-in): keep accumulating frames across calls
+            # instead of re-anchoring on a fresh single frame each call. Only triggers
+            # when rollout_no_reset is explicitly set AND we've already primed.
+            pass
+        elif self.language is None:
             print("language is None, reset current_start_frame to 0")
             self.language = data["text"]
             self.current_start_frame = 0

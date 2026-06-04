@@ -81,10 +81,23 @@ class AsyncActionChunkBroker:
         policy: WamClientPolicy,
         action_horizon: int = 24,
         smooth_window: int = 5,
+        sync: bool = False,
+        open_loop_horizon: int | None = None,
     ) -> None:
         self._policy = policy
         self._action_horizon = action_horizon
         self._smooth_window = smooth_window
+        # Receding horizon: execute this many actions of each predicted chunk before
+        # replanning. Upstream YAM (DreamZeroJointPosClient) uses 8. Defaults to the
+        # full chunk (legacy behavior) when not set.
+        self._open_loop_horizon = open_loop_horizon if open_loop_horizon else action_horizon
+        # sync=True: replan-at-completion. Execute the full chunk, THEN capture a FRESH
+        # observation and (blockingly) regenerate. Each chunk is anchored to the live
+        # state at generation time -> no one-chunk-stale anchor, no snap-back oscillation.
+        # Cost: a brief hold (~inference time) at each chunk boundary (arm holds last pose).
+        # sync=False (default): async pre-fetch (next inference starts at chunk start using
+        # obs from ~one chunk ago -> can oscillate on dynamic tasks).
+        self._sync = sync
 
         self._chunk: np.ndarray | None = None       # current chunk executing
         self._prev_chunk: np.ndarray | None = None  # finished chunk (for smoothing)
@@ -102,6 +115,19 @@ class AsyncActionChunkBroker:
                     Called only at chunk boundaries to feed the next inference.
                     Calling it every step is fine — it's cheap.
         """
+        # ── Sync mode: YAM-style receding horizon ───────────────────────────
+        # Mirrors upstream DreamZeroJointPosClient.infer: replan from a FRESH observation
+        # every open_loop_horizon steps (blocking), then execute chunk[step]. Each chunk is
+        # anchored to the live state at generation time -> no stale anchor, no snap-back.
+        # No seam smoothing (YAM doesn't): the fresh-obs anchor makes chunk[0] ~= current pose.
+        if self._sync:
+            if self._chunk is None or self._step >= self._open_loop_horizon:
+                obs = obs_fn()                       # fresh obs NOW (live state anchor)
+                self._chunk = self._fetch(obs)       # blocking inference; arm holds last pose
+                self._step = 0
+                logger.debug("Sync replan from fresh obs (receding horizon=%d).", self._open_loop_horizon)
+            return self._advance()
+
         # ── Cold start ──────────────────────────────────────────────────────
         if self._chunk is None:
             logger.info("Cold-start inference (blocking)...")
@@ -142,6 +168,14 @@ class AsyncActionChunkBroker:
         actions = np.asarray(result["actions"], dtype=np.float32)
         if actions.ndim == 1:
             actions = actions[np.newaxis, :]
+        # Debug: does the action model EVER intend to close the gripper within the chunk?
+        # If L/R min stays high (~open) across all steps, the action head is not commanding a
+        # grasp (disagrees with the video model). gripper dims: 6=L, 13=R (raw/10, ~84 open, ~28 closed).
+        if actions.shape[-1] >= 14:
+            lg, rg = actions[:, 6], actions[:, 13]
+            logger.info("grip CHUNK (raw/10): L[min=%.0f max=%.0f first=%.0f last=%.0f] "
+                        "R[min=%.0f max=%.0f first=%.0f last=%.0f]",
+                        lg.min(), lg.max(), lg[0], lg[-1], rg.min(), rg.max(), rg[0], rg[-1])
         return actions  # (T, 14)
 
     def _start_background_fetch(self, obs_fn: Callable[[], dict]) -> None:

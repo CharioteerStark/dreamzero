@@ -45,7 +45,9 @@ import http
 import logging
 import os
 import pickle
+import queue
 import socket
+import threading
 import time
 import traceback
 
@@ -89,6 +91,9 @@ class Args:
     # Expected WAM camera width/height (input is resized automatically if mismatched).
     image_width: int = 640
     image_height: int = 360
+    # Directory to save world-model video predictions for each replan. Empty = disabled.
+    # Each replan writes <save_video_dir>/replan_NNNN_<timestamp>.mp4 decoded from VAE latents.
+    save_video_dir: str = "./world_model_videos"
 
 
 class AdamWanPolicy:
@@ -114,6 +119,7 @@ class AdamWanPolicy:
         signal_group: "dist.ProcessGroup",
         default_prompt: str = "",
         expected_image_resolution: tuple[int, int] = (640, 360),
+        save_video_dir: str = "",
     ) -> None:
         self._policy = groot_policy
         self._signal_group = signal_group
@@ -124,6 +130,15 @@ class AdamWanPolicy:
             "observation/right_wrist",
         )
         self._expected_image_resolution = expected_image_resolution
+        self._save_video_dir = save_video_dir
+        self._replan_count = 0
+        self._save_queue: "queue.Queue | None" = None
+        if save_video_dir:
+            os.makedirs(save_video_dir, exist_ok=True)
+            self._save_queue = queue.Queue()
+            t = threading.Thread(target=self._video_save_worker, daemon=True, name="video_saver")
+            t.start()
+            logger.info("World-model video saving enabled → %s", save_video_dir)
 
     def _resize_if_needed(self, frame: np.ndarray, key: str) -> np.ndarray:
         expected_w, expected_h = self._expected_image_resolution
@@ -262,8 +277,14 @@ class AdamWanPolicy:
         batch = Batch(obs=converted_obs)
         dist.barrier()
         with torch.no_grad():
-            result_batch, _video_pred = self._policy.lazy_joint_forward_causal(batch)
+            result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
         dist.barrier()
+
+        # Enqueue world-model video pred + the ACTUAL observed grid for background save.
+        if self._save_queue is not None and video_pred is not None:
+            self._replan_count += 1
+            self._save_queue.put((self._replan_count, video_pred.detach().cpu(),
+                                  self._actual_grid(converted_obs)))
 
         # result_batch.act is a tianshou Batch with action.* attributes.
         action_chunk = result_batch.act
@@ -273,6 +294,63 @@ class AdamWanPolicy:
         actions = self._convert_action(action_dict)
         # Shape: (action_horizon=24, 14).
         return {"actions": actions}
+
+    def _actual_grid(self, converted_obs: dict) -> np.ndarray:
+        """Build the 2x2 grid of the ACTUAL observed frame (RGB), matching the model's layout
+        (top->TL, left_wrist->BL, right_wrist->TR, BR black)."""
+        H, W = 176, 320
+        top = converted_obs["video.top"][0]
+        lw = converted_obs["video.left_wrist"][0]
+        rw = converted_obs["video.right_wrist"][0]
+        g = np.zeros((2 * H, 2 * W, 3), np.uint8)
+        g[:H, :W] = cv2.resize(top, (W, H)); g[H:, :W] = cv2.resize(lw, (W, H)); g[:H, W:] = cv2.resize(rw, (W, H))
+        return g
+
+    def _video_save_worker(self) -> None:
+        """Background thread: drain the save queue, decode VAE latents, write MP4 + actual frame."""
+        while True:
+            item = self._save_queue.get()
+            if item is None:
+                break
+            replan_idx, video_pred_cpu, actual_grid = item
+            try:
+                self._decode_and_save(replan_idx, video_pred_cpu, actual_grid)
+            except Exception:
+                logger.exception("World-model video save failed for replan %d", replan_idx)
+            finally:
+                self._save_queue.task_done()
+
+    def _decode_and_save(self, replan_idx: int, video_pred_cpu: torch.Tensor,
+                         actual_grid: "np.ndarray | None" = None) -> None:
+        """Decode VAE latents to pixels and write an MP4. video_pred_cpu is on CPU.
+        Also save the actual observed grid (PNG) so predicted vs actual can be compared."""
+        ah = self._policy.trained_model.action_head
+        device = next(ah.vae.parameters()).device
+
+        with torch.no_grad():
+            # video_pred is (B, T, C, H, W) latent — vae.decode expects same.
+            frames_bcthw = ah.vae.decode(
+                video_pred_cpu.to(device=device),
+                tiled=ah.tiled,
+                tile_size=(ah.tile_size_height, ah.tile_size_width),
+                tile_stride=(ah.tile_stride_height, ah.tile_stride_width),
+            )
+        # (B, C, T, H, W) -> (T, H, W, C) uint8 RGB
+        frames = frames_bcthw[0].permute(1, 2, 3, 0)
+        frames = ((frames.float() + 1) * 127.5).clamp(0, 255).byte().cpu().numpy()
+
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self._save_video_dir, f"replan_{replan_idx:04d}_{ts}.mp4")
+        h, w = frames.shape[1], frames.shape[2]
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (w, h))
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.release()
+        # Save the ACTUAL observed grid for this replan (paired by index for side-by-side).
+        if actual_grid is not None:
+            cv2.imwrite(os.path.join(self._save_video_dir, f"actual_{replan_idx:04d}_{ts}.png"),
+                        cv2.cvtColor(actual_grid, cv2.COLOR_RGB2BGR))
+        logger.info("Saved world-model video: %s (%d frames) + actual frame", path, len(frames))
 
     def reset(self) -> None:
         """Protocol has no reset wire message; this is a no-op.
@@ -440,6 +518,7 @@ def main(args: Args) -> None:
             signal_group=signal_group,
             default_prompt=args.default_prompt,
             expected_image_resolution=(args.image_width, args.image_height),
+            save_video_dir=args.save_video_dir,
         )
 
         hostname = socket.gethostname()

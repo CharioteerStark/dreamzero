@@ -35,6 +35,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Gripper actuation speed (xArm units). The standalone test confirmed full open<->close
+# works at 2000 with wait=True; at the old 300 + wait=False it crawled and looked stuck.
+GRIPPER_SPEED = 3000
+
+# Gripper close threshold (raw/10 units). Below this -> fully closed (0); at/above -> fully
+# open (85). Binarizes the model's soft/partial gripper output into a decisive open/close so
+# a shallow close still produces a real grasp.
+GRIPPER_CLOSE_THRESH = 60.0
+BINARIZE_GRIP = True   # set False (--no-gripper-binary) to send the raw continuous gripper value
+
+
+def _binarize_grip(g: float) -> float:
+    """Binary gripper (raw/10): <thresh -> 0 (closed), else -> 85 (open/max).
+    When BINARIZE_GRIP is False, pass the raw continuous value through unchanged."""
+    if not BINARIZE_GRIP:
+        return g
+    return 0.0 if g < GRIPPER_CLOSE_THRESH else 85.0
+
 
 # ---------------------------------------------------------------------------
 # ZMQ camera subscriber
@@ -133,9 +151,9 @@ def _apply_arm_action(
 ) -> None:
     """Send 14-D action to both arms (non-blocking)."""
     left_joints  = action[0:6].tolist()
-    left_grip    = float(action[6])
+    left_grip    = _binarize_grip(float(action[6]))    # binary: 0 (closed) or 85 (open)
     right_joints = action[7:13].tolist()
-    right_grip   = float(action[13])
+    right_grip   = _binarize_grip(float(action[13]))
 
     left_arm.set_servo_angle(
         angle=left_joints, is_radian=True, wait=False,
@@ -145,10 +163,11 @@ def _apply_arm_action(
         angle=right_joints, is_radian=True, wait=False,
         speed=speed_rad_s, mvacc=acc_rad_s2,
     )
-    # Gripper: dataset stores raw/10; xArm expects raw int in [0, 840].
-    # speed=1000 r/min is the default max; use a gentler value to avoid sudden jumps.
-    left_arm.set_gripper_position(int(np.clip(left_grip * 10.0, 0, 840)), wait=False, speed=300)
-    right_arm.set_gripper_position(int(np.clip(right_grip * 10.0, 0, 840)), wait=False, speed=300)
+    # Gripper: model outputs raw/10 (0-84); set_gripper_position takes 0-850 (850=open, 0=closed),
+    # so ×10 is required. High speed + wait=False so it actuates between control steps instead of
+    # crawling (speed=300 was too slow to track a moving target -> looked like it never moved).
+    left_arm.set_gripper_position(int(np.clip(left_grip * 10.0, 0, 850)), wait=False, speed=GRIPPER_SPEED)
+    right_arm.set_gripper_position(int(np.clip(right_grip * 10.0, 0, 850)), wait=False, speed=GRIPPER_SPEED)
 
 
 # ---------------------------------------------------------------------------
@@ -187,9 +206,9 @@ def parse_args() -> argparse.Namespace:
     # Safety
     p.add_argument("--max-joint-jump-deg", type=float, default=30.0,
                    help="Skip action if any joint would move more than this many degrees")
-    p.add_argument("--joint-speed-deg-s", type=float, default=30.0,
+    p.add_argument("--joint-speed-deg-s", type=float, default=80.0,
                    help="xArm max joint speed (deg/s)")
-    p.add_argument("--joint-acc-deg-s2", type=float, default=200.0,
+    p.add_argument("--joint-acc-deg-s2", type=float, default=400.0,
                    help="xArm max joint acceleration (deg/s²)")
     p.add_argument("--frame-max-age-s", type=float, default=0.5,
                    help="Max camera frame age before skipping inference")
@@ -197,6 +216,19 @@ def parse_args() -> argparse.Namespace:
     # Motion enable
     p.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True,
                    help="Log targets without moving. Use --no-dry-run to enable motion.")
+    # Control loop — default is YAM-aligned (synchronous receding horizon from fresh obs).
+    p.add_argument("--open-loop-horizon", type=int, default=8,
+                   help="Execute this many actions of each predicted chunk before replanning "
+                        "from a fresh observation (upstream YAM uses 8). Must be <= --chunk-size.")
+    p.add_argument("--async-prefetch", action="store_true",
+                   help="Legacy: use the async pre-fetch broker (executes the full chunk, next "
+                        "inference uses obs from ~1 chunk ago). Can oscillate; off by default.")
+    p.add_argument("--gripper-close-thresh", type=float, default=GRIPPER_CLOSE_THRESH,
+                   help="Binary gripper threshold (raw/10): predicted gripper below this -> fully "
+                        "closed (grasp), at/above -> fully open. Raise it (e.g. 70) if the model's "
+                        "close is shallow (~57) and never crosses the default.")
+    p.add_argument("--no-gripper-binary", action="store_true",
+                   help="Disable gripper binarization; send the raw continuous predicted gripper value.")
 
     return p.parse_args()
 
@@ -207,6 +239,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    global GRIPPER_CLOSE_THRESH, BINARIZE_GRIP
+    GRIPPER_CLOSE_THRESH = args.gripper_close_thresh   # live-tunable binary gripper threshold
+    BINARIZE_GRIP = not args.no_gripper_binary
+    logger.info("Gripper: %s", f"binary (thresh {GRIPPER_CLOSE_THRESH:.0f})" if BINARIZE_GRIP
+                else "CONTINUOUS (binarization disabled)")
     speed_rad_s = float(np.radians(args.joint_speed_deg_s))
     acc_rad_s2  = float(np.radians(args.joint_acc_deg_s2))
     max_jump_rad = float(np.radians(args.max_joint_jump_deg))
@@ -259,8 +296,16 @@ def main() -> None:
     # ── Policy server ─────────────────────────────────────────────────────
     logger.info("Connecting to policy server...")
     policy = WamClientPolicy(host=args.policy_host, port=args.policy_port)
-    broker = AsyncActionChunkBroker(policy=policy, action_horizon=args.chunk_size, smooth_window=args.smooth_window)
-    logger.info("Policy connected (chunk_size=%d, smooth_window=%d, async).", args.chunk_size, args.smooth_window)
+    # Default = YAM-aligned control loop: synchronous receding horizon, replan from the
+    # current observation every --open-loop-horizon steps (matches upstream YAM's
+    # DreamZeroJointPosClient). --async-prefetch opts back into the legacy async broker.
+    sync = not args.async_prefetch
+    broker = AsyncActionChunkBroker(policy=policy, action_horizon=args.chunk_size,
+                                    smooth_window=args.smooth_window, sync=sync,
+                                    open_loop_horizon=args.open_loop_horizon)
+    logger.info("Policy connected (chunk_size=%d, open_loop_horizon=%d, mode=%s).",
+                args.chunk_size, args.open_loop_horizon,
+                "async-prefetch(legacy)" if args.async_prefetch else "sync receding-horizon (YAM-aligned)")
 
     # ── Safety gate for live motion ───────────────────────────────────────
     if not args.dry_run:
@@ -342,11 +387,19 @@ def main() -> None:
                     )
             else:
                 _apply_arm_action(left_arm, right_arm, action, speed_rad_s, acc_rad_s2)
-                if iteration % 10 == 1:
+                if iteration % 5 == 1:
+                    # gripper: act = physical position now (raw, 0-850); pred = model output (raw/10);
+                    # cmd = value sent to SDK. If act doesn't follow cmd -> hardware; if pred stays
+                    # high -> action model never commands a close (disagrees with the video model).
+                    _, la_now = left_arm.get_gripper_position()
+                    _, ra_now = right_arm.get_gripper_position()
                     logger.info(
-                        "Iter %d LIVE: infer=%.0fms jump L=%.1f° R=%.1f°",
+                        "Iter %d LIVE: infer=%.0fms jump L=%.1f° R=%.1f° | "
+                        "gripL act=%s pred=%.1f cmd=%d  gripR act=%s pred=%.1f cmd=%d",
                         iteration, infer_ms,
                         np.degrees(left_jump_rad), np.degrees(right_jump_rad),
+                        la_now, float(action[6]),  int(_binarize_grip(float(action[6]))  * 10.0),
+                        ra_now, float(action[13]), int(_binarize_grip(float(action[13])) * 10.0),
                     )
 
             # Rate limiting

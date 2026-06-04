@@ -92,6 +92,14 @@ def main():
     lora_state = load_shards(lora_dir)
     print(f"  lora: {len(lora_state)} tensors")
 
+    # PEFT wraps the DiT as `<...>.base_model.model.<orig>`, so LoRA-save keys carry a
+    # `.base_model.model.` infix that the dense base (DreamZero-AgiBot) does NOT have.
+    # Strip it so both the lora_A/lora_B pairs and the non-LoRA encoder/decoder weights
+    # match the base keys (e.g. action_head.model.blocks.0.self_attn.q.weight).
+    n_before = len(lora_state)
+    lora_state = {k.replace(".base_model.model.", "."): v for k, v in lora_state.items()}
+    print(f"  normalized PEFT prefixes (.base_model.model. -> .) on {n_before} keys")
+
     merged: dict[str, torch.Tensor] = {k: v for k, v in base_state.items()}
     pairs_merged = 0
     non_lora_overrides = 0
