@@ -99,7 +99,7 @@ save_lora_only=true
 >
 > If your dataset is much smaller than YAM's, you can lower `max_steps` proportionally, but keep `per_device_train_batch_size=4` and the LR.
 
-> **Paper vs repo recipe.** The *paper* reports full-parameter fine-tuning and notes LoRA gave suboptimal results (footnote 7). The released *repo* (`yam_training.sh`) uses **LoRA** for YAM embodiment adaptation, and YAM has been validated on a real robot. We follow the repo's LoRA recipe. If you have the disk/compute and want to chase the paper's reported quality, switch to full fine-tuning (`train_architecture=full`, `save_lora_only=false`, DeepSpeed `zero2_offload`, `bs=1`) — see `scripts/train/droid_training_full_finetune.sh`.
+> **Paper vs repo recipe.** The *paper* reports full-parameter fine-tuning and notes LoRA gave suboptimal results (footnote 7). The released *repo* (`yam_training.sh`) uses **LoRA** for YAM embodiment adaptation, and YAM has been validated on a real robot. **The current Adam run uses full fine-tuning** (paper-aligned) on Tillicum: `scripts/train/adam_stage_a_full.sh` + `scripts/slurm/train_adam_full_tillicum.slurm`, `train_architecture=full`, `save_lora_only=false`, DeepSpeed **`zero2_offload`** (CPU Adam; `zero3` breaks the frozen tiled VAE, plain `zero2` OOMs), measured **bs=4 / LR 2e-5 / 7500 steps / save_steps 1000** on 8× H200 (~31.5 s/it). See the README "Adam Stage A on UW Tillicum" tables and `docs/TILLICUM_SETUP.md` for the full measured config and the throughput sweep (bs 1–5 fit, bs=6 OOMs). The LoRA recipe below remains the lighter-weight alternative.
 
 With 3× RTX PRO 6000 (96 GB each) set `NUM_GPUS=3`. `save_lora_only=true` keeps checkpoints small (~200 MB each); the inference server loads base + LoRA directly.
 
@@ -147,7 +147,7 @@ The server loads `base_model_name_or_path` automatically; ensure `./checkpoints/
 
 | Decision | Default | Why you might change it |
 |---|---|---|
-| LoRA (rank 4) vs full-FT | **LoRA, YAM-aligned repo recipe** (`max_steps=100000, bs=4, zero2`) | Full-FT is paper-aligned but needs ~28 GB per checkpoint + `zero2_offload`. Do **not** shorten Stage A below ~50k effective sample-updates — see §6 (gripper convergence) |
+| LoRA (rank 4) vs full-FT | **Full-FT, paper-aligned** is the current Adam run (`train_architecture=full`, `zero2_offload`, bs=4, LR 2e-5, 7500 steps on 8× H200). LoRA (`max_steps=100000, bs=4, zero2`) is the YAM-aligned alternative | Full-FT needs `zero2_offload` (CPU RAM ~1.8 TB for the offloaded Adam state) and **~230 GB per checkpoint** (incl. optimizer state) → write to scrubbed, not projects. Do **not** shorten Stage A below ~50k effective sample-updates — see §6 (gripper convergence) |
 | Stage A budget | 30–60 min, 10–12 tasks | Push to 90 min if your tasks need bimanual coordination or precision |
 | Camera placement | Top + L-wrist + R-wrist, fixed extrinsics | Match YAM; lock the cell once capture starts |
 

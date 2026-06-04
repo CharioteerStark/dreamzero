@@ -243,6 +243,36 @@ The training script uses Hydra for configuration and DeepSpeed ZeRO Stage 2 for 
 
 > **Note:** `max_steps=10` is set for a quick sanity check. For full training, increase this to your desired number of steps and configure `save_steps` / `save_strategy` accordingly.
 
+#### Adam Stage A on UW Tillicum (8× H200) — measured configs
+
+Embodiment adaptation of `DreamZero-AgiBot` on Tillicum (8× H200, 141 GB each). Full setup in [docs/TILLICUM_SETUP.md](docs/TILLICUM_SETUP.md). Two validated recipes — **full fine-tune** is the current run (paper-aligned, footnote 7); LoRA is the YAM-exact alternative.
+
+**Full fine-tune (current run).** Launch: `bash scripts/slurm/submit_chain.sh 4 train_adam_full_tillicum.slurm` → `scripts/train/adam_stage_a_full.sh`.
+
+| Setting | Value | Why |
+|---|---|---|
+| `train_architecture` | `full` (~16.5B trainable) | the paper's full-parameter approach |
+| DeepSpeed | `zero2_offload` (CPU Adam) | plain `zero2` **OOMs VRAM** (full bf16 weights replicate per GPU); **`zero3` breaks the frozen tiled VAE encode** (`Sizes must match 384 vs 96`). Offload puts the ~198 GB fp32 Adam state on **CPU RAM** → `--mem=1800G` |
+| `per_device_train_batch_size` | **4** | throughput sweep: bs 1–5 all fit, **bs=6 OOMs (8/8 ranks)**. bs=5 is peak throughput but at the OOM cliff → bs=4 = 96% of peak with a VRAM margin for a multi-day run |
+| `learning_rate` | `2e-5` | √-scaling for effective batch 8→32 (the Adam-appropriate rule; linear's 4e-5 risks divergence) |
+| `max_steps` / `save_steps` | **7500 / 1000** | 7500 = same total samples as 30k @ bs1. **`save_steps` MUST be < ~2700** = steps reachable in the 24 h walltime @ 31.5 s/it, else no checkpoint ever writes and chained slices restart from step 0 forever |
+| Build / runtime | `gcc/11.5.0` (not 13.4) + `DS_SKIP_CUDA_CHECK=1` + pre-build `cpu_adam` single-process | gcc 13 `-march=native` emits an AVX512-FP16 op the assembler rejects; 8 ranks racing to JIT-build `cpu_adam` → missing `.so` |
+| Throughput | **≈ 31.5 s/step** (bs=4, steady) → ~65.6 h for 7500 steps | ~2.3× faster than RTX PRO 6000 |
+
+> Full-FT throughput by batch size (8× H200, steady): bs1 13.6s · bs2 19.1s · bs3 25.5s · bs4 31.5s · bs5 37.8s · **bs6 OOM**. Samples/s climbs with diminishing returns and plateaus near the OOM ceiling.
+
+**LoRA (YAM-exact alternative).** Launch: `scripts/slurm/train_adam_tillicum.slurm`.
+
+| Setting | Value | Why |
+|---|---|---|
+| `train_architecture` | `lora` (rank 4 / α 4) | YAM-exact Stage A recipe; 14B base frozen |
+| DeepSpeed | `zero2` | shards the (tiny) LoRA optimizer state; frozen base replicated per GPU. Offload pointless here — the LoRA optimizer is already MBs, so it would only add PCIe latency |
+| `per_device_train_batch_size` | **3** | bs=4 fits on **1** GPU but **OOMs on 8** (NCCL/DeepSpeed comm buffers); bs=3 → global batch 24 |
+| `learning_rate` | `1e-5` (default) | YAM default |
+| Throughput | **≈ 22.5 s/step** (bs=3, steady) | |
+
+> **Shared gotchas (both recipes):** set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (reclaims ~9 GB fragmentation). For runtime CUDA use `module load gcc` + manual `CUDA_HOME` — do **not** load the `cuda` module (its cuDNN 9.14 shadows torch's bundled cuDNN → `CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH` at the first conv3d). LoRA and full-FT can run **concurrently on separate nodes**. Why LoRA and full-FT share the same per-GPU batch ceiling (~3–5): activation memory (the batch-scaling term) is identical; full-FT's extra cost is the optimizer state, which offload moves to CPU, not VRAM.
+
 
 ## Citation
 

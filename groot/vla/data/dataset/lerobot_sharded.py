@@ -1,5 +1,6 @@
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import time
 
@@ -577,6 +578,26 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                     )
                     # Skip this sample if state or action data is empty
                     if data[key] is not None and hasattr(data[key], '__len__') and len(data[key]) == 0:
+                        return None
+        # --- bs>1 uniform-chunk guard (enable via env REQUIRE_UNIFORM_CHUNKS=1) -----------
+        # Edge-of-episode windows can form fewer than max_chunk_size chunks: video < 8n+1,
+        # state < max_chunk_size, action < 24*max_chunk_size (the off-by-one bounds + video
+        # trim in the samplers). Such samples are individually model-valid (so bs=1 trains
+        # fine) but won't np.stack with full-size samples -> the collate crash at bs>=2
+        # (dreamzero_cotrain.py:163, key='state'). Dropping these non-uniform edge windows
+        # makes every emitted sample shape-identical to the common full-window case, so bs>1
+        # batches cleanly with NO change to the retained samples' content. Gated so bs=1 and
+        # other datasets are unaffected.
+        if os.environ.get("REQUIRE_UNIFORM_CHUNKS") == "1":
+            mcs = self.max_chunk_size
+            expected = {"video": 8 * mcs + 1, "state": mcs, "action": 24 * mcs}
+            for modality in self.modality_keys:
+                exp = expected.get(modality)
+                if exp is None:
+                    continue
+                for key in self.modality_keys[modality]:
+                    v = data.get(key)
+                    if v is not None and hasattr(v, "__len__") and len(v) != exp:
                         return None
         return data
 
