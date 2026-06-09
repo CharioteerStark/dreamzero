@@ -155,6 +155,8 @@ def main():
         description="Build TensorRT engine for the DreamZero DiT model."
     )
     parser.add_argument("--model-path", required=True, help="Path to checkpoint directory.")
+    parser.add_argument("--embodiment", default="adam",
+                        help="Embodiment tag key in the checkpoint metadata.json (e.g. adam, oxe_droid).")
     parser.add_argument(
         "--tensorrt",
         required=True,
@@ -203,7 +205,7 @@ def main():
     device_mesh = _init_single_gpu_mesh()
 
     policy = GrootSimPolicy(
-        embodiment_tag=EmbodimentTag("oxe_droid"),
+        embodiment_tag=EmbodimentTag(args.embodiment),
         model_path=args.model_path,
         device="cuda" if torch.cuda.is_available() else "cpu",
         device_mesh=device_mesh,
