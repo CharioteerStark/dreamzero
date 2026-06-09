@@ -91,9 +91,10 @@ class Args:
     # Expected WAM camera width/height (input is resized automatically if mismatched).
     image_width: int = 640
     image_height: int = 360
-    # Directory to save world-model video predictions for each replan. Empty = disabled.
-    # Each replan writes <save_video_dir>/replan_NNNN_<timestamp>.mp4 decoded from VAE latents.
-    save_video_dir: str = "./world_model_videos"
+    # Directory to save world-model video predictions for each replan. Empty = DISABLED (default).
+    # When set, each replan VAE-decodes the predicted latents to an MP4 (GPU work on a background
+    # thread + disk I/O) — extra load during serving, so off by default. Pass --save-video-dir to enable.
+    save_video_dir: str = ""
 
 
 class AdamWanPolicy:

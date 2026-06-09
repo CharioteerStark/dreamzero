@@ -19,6 +19,7 @@ With 24-step chunks at 10 Hz (2.4s per chunk) and ~3s inference on H100:
 
 import logging
 import threading
+import time
 from typing import Callable
 
 import numpy as np
@@ -27,6 +28,10 @@ from scipy.signal import savgol_filter
 from eval_utils.wam_client import WamClientPolicy
 
 logger = logging.getLogger(__name__)
+
+# Joint dims of the 14-D action (L arm 0-5, R arm 7-12). Grippers (6, 13) are excluded
+# from re-anchoring — they're near-binary and barely drift over a single chunk.
+_JOINT_IDX = np.array([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12])
 
 
 def _smooth_boundary(prev_chunk: np.ndarray, next_chunk: np.ndarray, window: int = 5) -> np.ndarray:
@@ -83,10 +88,31 @@ class AsyncActionChunkBroker:
         smooth_window: int = 5,
         sync: bool = False,
         open_loop_horizon: int | None = None,
+        reanchor: bool = True,
+        reanchor_skip: int = 2,
+        chunk_tail_skip: int = 0,
     ) -> None:
         self._policy = policy
         self._action_horizon = action_horizon
         self._smooth_window = smooth_window
+        # Re-anchoring (async only): the model's actions are relative, reconstructed by the
+        # server to absolute against the observation's joint state. In async pre-fetch that
+        # observation is ~one inference (~3s) stale, so the chunk's absolute targets are anchored
+        # to where the arm WAS, which snaps it back -> oscillation (worst near the object, where
+        # corrective moves are small). Re-anchoring re-bases each new chunk's joint targets so
+        # step 0 == the LIVE pose at activation: cmd[k] = chunk[k] - chunk[0] + live_state.
+        # Keeps async's hold-free smoothness while removing the stale-anchor snap-back.
+        # Grippers (dims 6,13) are left as server-returned (they barely drift over one chunk).
+        self._reanchor = reanchor
+        # async only: drop this many leading steps of each chunk and anchor AT that index, so the
+        # first executed command == the LIVE pose -> kills the stale-obs snap-back ("going back to
+        # where the arm was"). Higher = reanchors harder (skips more of the stale chunk start).
+        self._reanchor_skip = max(0, int(reanchor_skip))
+        # async only: stop executing each chunk this many steps BEFORE the end (drop the trailing,
+        # most-extrapolated steps) and swap to the fresher pre-fetched chunk earlier.
+        self._chunk_tail_skip = max(0, min(int(chunk_tail_skip), action_horizon - 1))
+        self._anchor_base: np.ndarray | None = None   # chunk[reanchor_skip] of the active chunk
+        self._anchor_state: np.ndarray | None = None  # live 14-D joint state at activation
         # Receding horizon: execute this many actions of each predicted chunk before
         # replanning. Upstream YAM (DreamZeroJointPosClient) uses 8. Defaults to the
         # full chunk (legacy behavior) when not set.
@@ -106,6 +132,9 @@ class AsyncActionChunkBroker:
         self._next_chunk: np.ndarray | None = None  # pre-fetched next chunk
         self._next_lock = threading.Lock()
         self._inflight = threading.Event()
+        self._gen = 0   # bumped by force_replan() to invalidate in-flight (stale-obs) inferences
+        self._infer_lock = threading.Lock()   # serialize policy.infer(): one ws.recv() at a time
+        self._last_recalc_t: float | None = None   # for closed-loop (fresh-obs recalculation) rate
 
     def get_action(self, obs_fn: Callable[[], dict]) -> np.ndarray:
         """Return next (14,) action.
@@ -133,13 +162,14 @@ class AsyncActionChunkBroker:
             logger.info("Cold-start inference (blocking)...")
             obs = obs_fn()
             self._chunk = self._fetch(obs)
-            self._step = 0
+            self._set_anchor(obs)   # cold start: sent state == live state, so re-anchor is ~no-op
+            self._step = self._start_step()   # skip stale leading steps when re-anchoring
             # Immediately kick off background inference for chunk 1.
             self._start_background_fetch(obs_fn)
             return self._advance()
 
         # ── Chunk exhausted: try to swap ────────────────────────────────────
-        if self._step >= self._action_horizon:
+        if self._step >= self._action_horizon - self._chunk_tail_skip:
             with self._next_lock:
                 if self._next_chunk is not None:
                     self._prev_chunk = self._chunk
@@ -147,24 +177,77 @@ class AsyncActionChunkBroker:
                         self._prev_chunk, self._next_chunk, self._smooth_window
                     )
                     self._next_chunk = None
-                    self._step = 0
-                    logger.debug("Swapped to next chunk (smoothed).")
-                    # Start inference for chunk N+1 immediately.
-                    self._start_background_fetch(obs_fn)
+                    self._step = self._start_step()   # skip stale leading steps when re-anchoring
+                    # Re-anchor the incoming chunk to the LIVE pose now (it was generated from
+                    # an obs ~one inference ago). One fresh obs read; reuse it for the next fetch.
+                    obs = obs_fn()
+                    self._set_anchor(obs)
+                    logger.debug("Swapped to next chunk (smoothed, re-anchored).")
+                    # Start inference for chunk N+1 immediately (reuse the obs we just read).
+                    self._start_background_fetch(obs_fn, obs=obs)
                 else:
                     # Inference not done yet — hold last action (arm stays put).
                     logger.debug("Next chunk not ready; holding last action.")
-                    return self._chunk[-1].copy()
+                    # Self-heal: make sure a prefetch is in flight (e.g. after a force_replan
+                    # discarded the previous one) so we don't hold forever.
+                    self._start_background_fetch(obs_fn)
+                    return self._reanchor_action(self._chunk[-1].copy())
 
         return self._advance()
+
+    def _set_anchor(self, obs: dict | None) -> None:
+        """Record the active chunk's base (chunk[0]) and the live joint state, so the
+        chunk's joint targets can be re-based to the current pose at execution time."""
+        if not self._reanchor or self._sync or self._chunk is None:
+            return
+        idx = min(self._reanchor_skip, self._chunk.shape[0] - 1)
+        self._anchor_base = self._chunk[idx].copy()
+        state = obs.get("observation/state") if obs else None
+        self._anchor_state = (
+            np.asarray(state, dtype=np.float32) if state is not None else self._chunk[0].copy()
+        )
+
+    def _reanchor_action(self, action: np.ndarray) -> np.ndarray:
+        """Re-base joint targets so chunk[0] maps to the live pose: cmd = a - base + live."""
+        if (not self._reanchor or self._sync
+                or self._anchor_base is None or self._anchor_state is None):
+            return action
+        action[_JOINT_IDX] = (
+            action[_JOINT_IDX] - self._anchor_base[_JOINT_IDX] + self._anchor_state[_JOINT_IDX]
+        )
+        return action
+
+    def _start_step(self) -> int:
+        """First step index of a freshly-activated chunk. When re-anchoring (async), skip the
+        stale leading steps so the first executed command == the live pose (no snap-back)."""
+        if self._reanchor and not self._sync and self._chunk is not None:
+            return min(self._reanchor_skip, self._chunk.shape[0] - 1)
+        return 0
+
+    def _log_closed_loop(self) -> None:
+        """Closed-loop rate = how often the model recalculates a brand-new plan from FRESH camera
+        feedback (one fresh-obs inference). Called at the start of each _fetch; the period is
+        dominated by the inference time (so it reads ~1/inference_time)."""
+        now = time.monotonic()
+        if self._last_recalc_t is not None:
+            dt = now - self._last_recalc_t
+            logger.info("[closed-loop] %.2f Hz (recalculated a new plan from fresh obs every %.2fs)",
+                        (1.0 / dt if dt > 0 else 0.0), dt)
+        self._last_recalc_t = now
 
     def _advance(self) -> np.ndarray:
         action = self._chunk[self._step].copy()
         self._step += 1
-        return action
+        return self._reanchor_action(action)
 
     def _fetch(self, obs: dict) -> np.ndarray:
-        result = self._policy.infer(obs)
+        self._log_closed_loop()   # a fresh-obs recalculation (brand-new plan) starts here
+        # Single websocket -> only one infer (send+recv) at a time. Without this, a force_replan
+        # cold-start fetch on the main thread races the in-flight background prefetch -> recv() on
+        # the same socket from two threads -> ConcurrencyError. The main thread waits here for the
+        # in-flight (stale) inference to finish; its result is then dropped by the _gen guard.
+        with self._infer_lock:
+            result = self._policy.infer(obs)
         actions = np.asarray(result["actions"], dtype=np.float32)
         if actions.ndim == 1:
             actions = actions[np.newaxis, :]
@@ -178,26 +261,43 @@ class AsyncActionChunkBroker:
                         lg.min(), lg.max(), lg[0], lg[-1], rg.min(), rg.max(), rg[0], rg[-1])
         return actions  # (T, 14)
 
-    def _start_background_fetch(self, obs_fn: Callable[[], dict]) -> None:
+    def _start_background_fetch(self, obs_fn: Callable[[], dict], obs: dict | None = None) -> None:
         if self._inflight.is_set():
             return
         self._inflight.set()
+        gen = self._gen   # tag this inference; discard its result if force_replan bumps _gen
         t = threading.Thread(
-            target=self._background_fetch, args=(obs_fn,), daemon=True, name="infer_bg"
+            target=self._background_fetch, args=(obs_fn, obs, gen), daemon=True, name="infer_bg"
         )
         t.start()
 
-    def _background_fetch(self, obs_fn: Callable[[], dict]) -> None:
+    def _background_fetch(self, obs_fn: Callable[[], dict], obs: dict | None = None, gen: int = 0) -> None:
         try:
-            obs = obs_fn()   # capture fresh observation now, at inference start
+            if obs is None:
+                obs = obs_fn()   # capture fresh observation now, at inference start
             chunk = self._fetch(obs)
             with self._next_lock:
-                self._next_chunk = chunk
+                if gen == self._gen:        # keep only if no force_replan happened meanwhile
+                    self._next_chunk = chunk
+                else:
+                    logger.debug("Discarding stale background chunk (gen %d != %d).", gen, self._gen)
             logger.debug("Background inference complete.")
         except Exception:
             logger.exception("Background inference failed.")
         finally:
             self._inflight.clear()
+
+    def force_replan(self) -> None:
+        """Abandon the active (and pre-fetched) chunk so the next get_action() regenerates from a
+        FRESH observation. Used by the client's force guard to drop a chunk that is pressing too
+        hard — the next get_action cold-starts a blocking inference from the current (contact) pose."""
+        with self._next_lock:
+            self._gen += 1           # invalidate any in-flight (stale-obs) background inference
+            self._chunk = None
+            self._next_chunk = None
+            self._step = 0
+            self._anchor_base = None
+            self._anchor_state = None
 
     def reset(self) -> None:
         with self._next_lock:
@@ -205,3 +305,5 @@ class AsyncActionChunkBroker:
             self._prev_chunk = None
             self._next_chunk = None
             self._step = 0
+            self._anchor_base = None
+            self._anchor_state = None

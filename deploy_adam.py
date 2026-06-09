@@ -40,15 +40,19 @@ logger = logging.getLogger(__name__)
 GRIPPER_SPEED = 3000
 
 # Gripper close threshold (raw/10 units). Below this -> fully closed (0); at/above -> fully
-# open (85). Binarizes the model's soft/partial gripper output into a decisive open/close so
-# a shallow close still produces a real grasp.
-GRIPPER_CLOSE_THRESH = 60.0
-BINARIZE_GRIP = True   # set False (--no-gripper-binary) to send the raw continuous gripper value
+# open (85). Binarizes the model's soft/partial gripper output into a decisive open/close,
+# mirroring upstream YAM's DreamZeroJointPosClient (which snaps the gripper at 0.5).
+GRIPPER_CLOSE_THRESH = 30.0
+# Default: BINARY gripper (open/close) at thresh 30. The q99 cap limits the model's per-chunk
+# open to ~37 raw/10, so the threshold MUST stay below ~37 (30 leaves margin) or a release from
+# closed never triggers "open". Use --no-gripper-binary for continuous pass-through.
+BINARIZE_GRIP = True
 
 
 def _binarize_grip(g: float) -> float:
-    """Binary gripper (raw/10): <thresh -> 0 (closed), else -> 85 (open/max).
-    When BINARIZE_GRIP is False, pass the raw continuous value through unchanged."""
+    """Binary gripper (raw/10): < thresh -> 0 (closed), else -> 85 (open/max).
+    Mirrors upstream YAM's DreamZeroJointPosClient (snaps gripper at 0.5 on its [0,1] scale).
+    Pass-through (continuous) when BINARIZE_GRIP is False (--no-gripper-binary)."""
     if not BINARIZE_GRIP:
         return g
     return 0.0 if g < GRIPPER_CLOSE_THRESH else 85.0
@@ -113,11 +117,19 @@ class _ZmqCamSubscriber:
 # xArm helpers
 # ---------------------------------------------------------------------------
 
-def _prepare_arm(arm: XArmAPI, label: str) -> None:
+def _prepare_arm(arm: XArmAPI, label: str,
+                 tcp_payload_kg: float = 0.0, tcp_cog_mm=(0.0, 0.0, 0.0)) -> None:
     arm.motion_enable(enable=True)
     arm.clean_warn()
     arm.clean_error()
     time.sleep(0.2)
+    # Gravity compensation: tell the controller the gripper(+payload) mass so the arm holds
+    # its pose instead of sagging (sag drifts joint torque -> force-guard false trips).
+    if tcp_payload_kg > 0:
+        code = arm.set_tcp_load(tcp_payload_kg, list(tcp_cog_mm))
+        logger.info("%s set_tcp_load(%.3f kg, cog=%s mm) -> code=%d",
+                    label, tcp_payload_kg, list(tcp_cog_mm), code)
+        time.sleep(0.1)
     # Mode 6: joint online planning — accepts sparse targets at ~10 Hz and
     # blends them with online trajectory generation.
     arm.set_mode(6)
@@ -142,6 +154,16 @@ def _read_arm_state(arm: XArmAPI, label: str) -> tuple[list[float], float]:
     return list(angles[:6]), float(gripper_raw) / 10.0
 
 
+def _read_joint_torque(arm: XArmAPI) -> Optional[np.ndarray]:
+    """Per-joint torque (Nm, 6,) estimated from motor current, or None on read error.
+    Includes gravity + payload, so use it as an EXCESS-over-baseline signal (contact spike),
+    not an absolute force. No F/T sensor required (uses get_joints_torque)."""
+    code, tq = arm.get_joints_torque()
+    if code != 0 or not tq:
+        return None
+    return np.asarray(tq[:6], dtype=np.float64)
+
+
 def _apply_arm_action(
     left_arm: XArmAPI,
     right_arm: XArmAPI,
@@ -151,7 +173,7 @@ def _apply_arm_action(
 ) -> None:
     """Send 14-D action to both arms (non-blocking)."""
     left_joints  = action[0:6].tolist()
-    left_grip    = _binarize_grip(float(action[6]))    # binary: 0 (closed) or 85 (open)
+    left_grip    = _binarize_grip(float(action[6]))    # gripper binary by default (raw/10); --no-gripper-binary for continuous
     right_joints = action[7:13].tolist()
     right_grip   = _binarize_grip(float(action[13]))
 
@@ -197,7 +219,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt", default="pick up the object", help="Language instruction for the policy")
 
     # Control
-    p.add_argument("--inference-freq", type=float, default=10.0, help="Control loop frequency (Hz)")
+    p.add_argument("--inference-freq", type=float, default=30.0,
+                   help="Control loop / open-loop playback frequency (Hz). Default 30 = the dataset "
+                        "fps, so the chunk plays at the speed it was trained.")
     p.add_argument("--duration-s", type=float, default=600.0, help="Total run duration (seconds)")
     p.add_argument("--chunk-size", type=int, default=24, help="Action horizon (must match model)")
     p.add_argument("--smooth-window", type=int, default=5,
@@ -221,14 +245,48 @@ def parse_args() -> argparse.Namespace:
                    help="Execute this many actions of each predicted chunk before replanning "
                         "from a fresh observation (upstream YAM uses 8). Must be <= --chunk-size.")
     p.add_argument("--async-prefetch", action="store_true",
-                   help="Legacy: use the async pre-fetch broker (executes the full chunk, next "
-                        "inference uses obs from ~1 chunk ago). Can oscillate; off by default.")
+                   help="Use the async pre-fetch broker (executes the full chunk, no inference "
+                        "holds -> smooth). Pair with --reanchor (default on) to avoid the "
+                        "stale-anchor snap-back oscillation.")
+    p.add_argument("--reanchor", action=argparse.BooleanOptionalAction, default=False,
+                   help="Async only: re-base each pre-fetched chunk's joint targets to the LIVE "
+                        "pose at activation (cmd = chunk - chunk[0] + current_state). Removes the "
+                        "snap-back oscillation while keeping async smoothness. Default OFF; "
+                        "--reanchor to enable.")
+    p.add_argument("--reanchor-skip", type=int, default=2,
+                   help="Async + --reanchor: drop this many leading steps of each chunk and anchor "
+                        "AT that index, so the first executed command == the live pose. Higher = "
+                        "reanchors 'harder' (skips more of the stale snap-back start). Default 2.")
+    p.add_argument("--chunk-tail-skip", type=int, default=0,
+                   help="Async: stop each chunk this many steps BEFORE the end (drop the trailing, "
+                        "most-extrapolated steps) and swap to the fresher pre-fetched chunk earlier. "
+                        "Default 0.")
+
+    # Force guard (joint-torque based; no F/T sensor required)
+    p.add_argument("--force-stop", action=argparse.BooleanOptionalAction, default=False,
+                   help="Monitor joint-torque EXCESS over the free-motion baseline; if it exceeds "
+                        "HALF of --estop-torque (i.e. 2x more sensitive than the e-stop), stop the "
+                        "current chunk and regenerate from the contact pose. CALIBRATE --estop-torque first.")
+    p.add_argument("--estop-torque", type=float, default=20.0,
+                   help="E-stop boundary: joint-torque EXCESS (Nm) over baseline at which the hard "
+                        "collision/e-stop trips. The soft guard fires at HALF this value. "
+                        "PLACEHOLDER default 20 Nm -- MUST be calibrated to YOUR arm + payload.")
+    p.add_argument("--force-max-trips", type=int, default=5,
+                   help="Consecutive force trips before a HARD stop (set_state 4), to avoid pressing "
+                        "in a regenerate loop. Default 5.")
+    p.add_argument("--tcp-payload-kg", type=float, default=0.0,
+                   help="Payload mass (kg) at the TCP (gripper + held object) for gravity "
+                        "compensation via set_tcp_load. 0 = don't set (current behavior). Set this "
+                        "if an arm sags / its torque drifts (causes force-guard false trips).")
+    p.add_argument("--tcp-cog-mm", type=str, default="0,0,0",
+                   help="TCP center of gravity 'x,y,z' in mm for set_tcp_load. Default 0,0,0.")
     p.add_argument("--gripper-close-thresh", type=float, default=GRIPPER_CLOSE_THRESH,
                    help="Binary gripper threshold (raw/10): predicted gripper below this -> fully "
-                        "closed (grasp), at/above -> fully open. Raise it (e.g. 70) if the model's "
-                        "close is shallow (~57) and never crosses the default.")
-    p.add_argument("--no-gripper-binary", action="store_true",
-                   help="Disable gripper binarization; send the raw continuous predicted gripper value.")
+                        "closed (grasp), at/above -> fully open. Keep BELOW ~37 (the q99 open cap); "
+                        "default 30. Too high and releases from closed never fire.")
+    p.add_argument("--gripper-binary", action=argparse.BooleanOptionalAction, default=True,
+                   help="Binarize the gripper into open/close at --gripper-close-thresh. Default OFF: "
+                        "send the raw continuous predicted gripper value (matches training).")
 
     return p.parse_args()
 
@@ -240,10 +298,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     global GRIPPER_CLOSE_THRESH, BINARIZE_GRIP
-    GRIPPER_CLOSE_THRESH = args.gripper_close_thresh   # live-tunable binary gripper threshold
-    BINARIZE_GRIP = not args.no_gripper_binary
-    logger.info("Gripper: %s", f"binary (thresh {GRIPPER_CLOSE_THRESH:.0f})" if BINARIZE_GRIP
-                else "CONTINUOUS (binarization disabled)")
+    GRIPPER_CLOSE_THRESH = args.gripper_close_thresh
+    BINARIZE_GRIP = args.gripper_binary  # binary is the DEFAULT (--no-gripper-binary for continuous)
+    logger.info("Gripper: %s",
+                f"BINARY (open/close at thresh {GRIPPER_CLOSE_THRESH:.0f} raw/10)"
+                if BINARIZE_GRIP else "continuous (q99 prediction passed through)")
+    if BINARIZE_GRIP and GRIPPER_CLOSE_THRESH > 37:
+        logger.warning("gripper-close-thresh=%.0f > ~37 (q99 open cap): releases from closed may "
+                       "NEVER trigger 'open'. Consider --gripper-close-thresh 25-30.",
+                       GRIPPER_CLOSE_THRESH)
     speed_rad_s = float(np.radians(args.joint_speed_deg_s))
     acc_rad_s2  = float(np.radians(args.joint_acc_deg_s2))
     max_jump_rad = float(np.radians(args.max_joint_jump_deg))
@@ -283,8 +346,9 @@ def main() -> None:
     logger.info("Connecting to arms...")
     left_arm  = XArmAPI(args.left_arm_ip)
     right_arm = XArmAPI(args.right_arm_ip)
-    _prepare_arm(left_arm, "left")
-    _prepare_arm(right_arm, "right")
+    tcp_cog = tuple(float(x) for x in args.tcp_cog_mm.split(","))
+    _prepare_arm(left_arm, "left", args.tcp_payload_kg, tcp_cog)
+    _prepare_arm(right_arm, "right", args.tcp_payload_kg, tcp_cog)
 
     # Current position becomes the safe home (no auto-homing to a fixed pose).
     left_home_joints, left_home_grip   = _read_arm_state(left_arm, "left")
@@ -302,10 +366,13 @@ def main() -> None:
     sync = not args.async_prefetch
     broker = AsyncActionChunkBroker(policy=policy, action_horizon=args.chunk_size,
                                     smooth_window=args.smooth_window, sync=sync,
-                                    open_loop_horizon=args.open_loop_horizon)
-    logger.info("Policy connected (chunk_size=%d, open_loop_horizon=%d, mode=%s).",
+                                    open_loop_horizon=args.open_loop_horizon,
+                                    reanchor=args.reanchor, reanchor_skip=args.reanchor_skip,
+                                    chunk_tail_skip=args.chunk_tail_skip)
+    logger.info("Policy connected (chunk_size=%d, open_loop_horizon=%d, mode=%s%s).",
                 args.chunk_size, args.open_loop_horizon,
-                "async-prefetch(legacy)" if args.async_prefetch else "sync receding-horizon (YAM-aligned)")
+                "async-prefetch" if args.async_prefetch else "sync receding-horizon (YAM-aligned)",
+                f", reanchor={args.reanchor}" if args.async_prefetch else "")
 
     # ── Safety gate for live motion ───────────────────────────────────────
     if not args.dry_run:
@@ -320,6 +387,9 @@ def main() -> None:
     start_t = time.monotonic()
     next_tick = start_t
     iteration = 0
+    tq_base = {"left": None, "right": None}   # per-arm joint-torque EMA baseline (free motion)
+    force_trips = 0
+    force_quiet = False   # once a trip fires, stop the per-iteration [force] spam
 
     try:
         while time.monotonic() - start_t < args.duration_s:
@@ -360,6 +430,68 @@ def main() -> None:
             t0 = time.monotonic()
             action = broker.get_action(obs_fn)   # (14,) float32
             infer_ms = (time.monotonic() - t0) * 1000.0
+
+            # ── Force guard: stop current chunk & regenerate if pressing too hard ──
+            # Soft trip = HALF the e-stop boundary (2x more sensitive), measured as joint-torque
+            # excess over a slow free-motion baseline (gravity/payload live in the baseline).
+            if args.force_stop:
+                soft = args.estop_torque / 2.0
+                excess = 0.0
+                worst_arm, worst_joint = "?", 0   # which arm/joint drives the max excess
+                dbg = []
+                for lab, a in (("left", left_arm), ("right", right_arm)):
+                    cur = _read_joint_torque(a)
+                    if cur is None:
+                        dbg.append(f"{lab}: TORQUE-READ-FAILED")
+                        continue
+                    base = tq_base[lab]
+                    if base is None:
+                        tq_base[lab] = cur
+                        dbg.append(f"{lab}: baseline-init tau={np.round(cur, 1).tolist()}")
+                        continue
+                    diff = np.abs(cur - base)
+                    e = float(np.max(diff))
+                    j = int(np.argmax(diff))          # which joint drives the excess
+                    if e > excess:
+                        excess, worst_arm, worst_joint = e, lab, j
+                    if e < soft:                      # track slow drift (gravity sag) up to the trip
+                        tq_base[lab] = 0.95 * base + 0.05 * cur   # only a FAST spike outruns this -> trips
+                    dbg.append(f"{lab}: tau={np.round(cur, 1).tolist()} "
+                               f"base={np.round(base, 1).tolist()} exc={e:.1f}@J{j + 1}")
+                # Force debug: print every ~10 steps, and go QUIET once a trip/e-stop has fired so
+                # the actual stopping force (the TRIP / HARD STOP lines) isn't buried in the stream.
+                if not force_quiet and iteration % 10 == 1:
+                    logger.info("[force] iter=%d excess=%.1f soft=%.1f estop=%.1f trips=%d | %s",
+                                iteration, excess, soft, args.estop_torque, force_trips, "  ".join(dbg))
+                if excess > soft:
+                    force_trips += 1
+                    force_quiet = True   # suppress the per-iteration line from here on
+                    logger.warning("Iter %d FORCE TRIP: %s arm J%d excess %.1f Nm > soft %.1f "
+                                   "(e-stop %.1f) -> hold + regenerate (#%d/%d)",
+                                   iteration, worst_arm.upper(), worst_joint + 1, excess, soft,
+                                   args.estop_torque, force_trips, args.force_max_trips)
+                    if not args.dry_run:
+                        # Stop driving into contact: command the CURRENT measured pose (hold).
+                        lj, _ = _read_arm_state(left_arm, "left")
+                        rj, _ = _read_arm_state(right_arm, "right")
+                        left_arm.set_servo_angle(angle=lj, is_radian=True, wait=False,
+                                                 speed=speed_rad_s, mvacc=acc_rad_s2)
+                        right_arm.set_servo_angle(angle=rj, is_radian=True, wait=False,
+                                                  speed=speed_rad_s, mvacc=acc_rad_s2)
+                    broker.force_replan()        # abandon this chunk; fresh inference next tick
+                    if force_trips >= args.force_max_trips:
+                        logger.error("Iter %d: %d consecutive force trips -> HARD STOP "
+                                     "(raise --estop-torque / --force-max-trips if false-tripping).",
+                                     iteration, force_trips)
+                        if not args.dry_run:
+                            left_arm.set_state(4)
+                            right_arm.set_state(4)
+                        break
+                    next_tick += period
+                    time.sleep(max(0.0, next_tick - time.monotonic()))
+                    continue
+                else:
+                    force_trips = 0
 
             # Safety: skip if any joint would jump too far
             left_target  = action[0:6]
