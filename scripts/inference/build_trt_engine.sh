@@ -111,6 +111,16 @@ export CUDA_VISIBLE_DEVICES="$CUDA_DEVICE"
 export ATTENTION_BACKEND="TE"
 export HYDRA_FULL_ERROR=1
 
+# Use the 'dreamzero' conda env (has tianshou/torch/tensorrt/modelopt); base python lacks them.
+CONDA_ENV_ROOT="${CONDA_ENV_ROOT:-/home/thematrix/miniconda3/envs/dreamzero}"
+if [[ ! -x "${CONDA_ENV_ROOT}/bin/python" ]]; then
+    echo "Error: conda env not found at ${CONDA_ENV_ROOT}. Override via CONDA_ENV_ROOT." >&2
+    exit 1
+fi
+export PATH="${CONDA_ENV_ROOT}/bin:${PATH}"
+export CUDA_HOME="${CONDA_ENV_ROOT}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -129,7 +139,7 @@ fi
 torchrun \
     --standalone \
     --nproc_per_node=1 \
-    "${REPO_ROOT}/scripts/inference/build_trt_engine_droid.py" \
+    "${REPO_ROOT}/scripts/inference/build_trt_engine.py" \
     "${PYTHON_ARGS[@]}"
 
 echo "=========================================="
