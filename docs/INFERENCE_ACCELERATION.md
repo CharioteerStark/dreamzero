@@ -32,9 +32,11 @@ So **4 steps is the no-retrain sweet spot**; 1-step requires Flash training.
 
 ## Plan (ranked; non-Flash only)
 
-1. **Reduce denoising steps 16 → 4** — `WAM_NUM_INFERENCE_STEPS=4` (env, read at server start). Near-linear
-   on the 2.45 s diffusion. Expected ~2 DiT computes ⇒ ~0.6 s diffusion ⇒ ~1.2 s total ⇒ ~0.8 Hz.
-   Quality: paper's 4-step baseline = 83%. **STATUS: testing now (bench + eyeball a real fold).**
+1. **Reduce denoising steps 16 → 4** — `WAM_NUM_INFERENCE_STEPS=4` (env, read at server start).
+   **DONE / measured (2026-06-09):** total **3.08 s → 1.52 s (0.32 → 0.66 Hz, ~2×)**; diffusion
+   2.45 → 0.91 s (8 → 3 DiT computes). Quality: paper's 4-step baseline = 83% — **still need to
+   eyeball a real fold** before committing the default. After this, fixed overhead (image-encoder
+   0.39 s + KV 0.18 s = 0.57 s) is now ~37% of latency → next target.
 2. **Tune DiT cache more aggressively** — skip more steps if quality holds (it already does 16→8).
 3. **torch.compile + CUDA Graphs on the DiT blocks** — the biggest no-quality-loss lever (~2×). The repo
    deliberately left `Wan _forward_blocks` uncompiled; blocker is dynamic shapes from the causal-chunk
