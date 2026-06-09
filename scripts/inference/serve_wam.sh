@@ -56,6 +56,10 @@ fi
 export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
 export ATTENTION_BACKEND="TE"
 export HYDRA_FULL_ERROR=1
+# Diffusion denoising steps to generate one action chunk (read by the action head at startup).
+# Default 4 = DreamZero's deploy baseline (~83% task progress, ~2x faster than 16). Override:
+#   WAM_NUM_INFERENCE_STEPS=8 bash scripts/inference/serve_wam.sh ...
+export WAM_NUM_INFERENCE_STEPS="${WAM_NUM_INFERENCE_STEPS:-4}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -81,6 +85,7 @@ echo "  Port           : $PORT"
 echo "  GPUs           : $N_GPUS (CUDA_VISIBLE_DEVICES=$CUDA_DEVICES)"
 echo "  Python         : $(command -v python)"
 echo "  Default prompt : $DEFAULT_PROMPT"
+echo "  Denoise steps  : $WAM_NUM_INFERENCE_STEPS"
 echo "  Protocol       : openpi-style msgpack/websocket; clients must set chunk_size=24"
 echo "  World-model    : ${SAVE_VIDEO_DIR:-./world_model_videos (default)}"
 echo "=========================================="
