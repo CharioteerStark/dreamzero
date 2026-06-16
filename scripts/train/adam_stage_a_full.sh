@@ -43,6 +43,10 @@ SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-5}     # repo floor is 5 ("standardized eva
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 PER_DEVICE_BS=${PER_DEVICE_BS:-1}           # bs>1 OOMs on the multi-view grid
 DEEPSPEED_CFG=${DEEPSPEED_CFG:-zero2_offload}
+# Extra hydra overrides appended verbatim (space-separated). Used by wrappers to flip
+# variant flags without forking this script — e.g. the Flash (decoupled-noise) run sets:
+#   EXTRA_OVERRIDES="action_head_cfg.config.decouple_video_action_noise=true ..."
+EXTRA_OVERRIDES=${EXTRA_OVERRIDES:-}
 # =====================================
 
 if [ ! -d "$WAN_CKPT_DIR" ] || [ -z "$(ls -A "$WAN_CKPT_DIR" 2>/dev/null)" ]; then
@@ -103,4 +107,5 @@ $TORCHRUN --nproc_per_node $NUM_GPUS --standalone groot/vla/experiment/experimen
     vae_pretrained_path=$WAN_CKPT_DIR/Wan2.1_VAE.pth \
     tokenizer_path=$TOKENIZER_DIR \
     pretrained_model_path=$PRETRAINED_MODEL_PATH \
-    ++action_head_cfg.config.skip_component_loading=true
+    ++action_head_cfg.config.skip_component_loading=true \
+    $EXTRA_OVERRIDES
