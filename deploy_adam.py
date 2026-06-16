@@ -48,14 +48,38 @@ GRIPPER_CLOSE_THRESH = 30.0
 # closed never triggers "open". Use --no-gripper-binary for continuous pass-through.
 BINARIZE_GRIP = True
 
+# Gripper rounding step (raw/10 units). >0 quantizes the continuous prediction by rounding DOWN
+# to a multiple (e.g. step=10: 32->30, 26->20, 84->80), snapping out sub-step jitter while keeping
+# a graded gripper. Only applies in continuous mode (BINARIZE_GRIP off already snaps to 0/85).
+# NOTE: floor removes sub-step noise only; a value oscillating around a bucket edge (e.g. ~30)
+# still flips 20<->30 step-to-step -> use hysteresis for boundary chatter, not rounding.
+GRIPPER_ROUND_STEP = 0.0
+
 
 def _binarize_grip(g: float) -> float:
-    """Binary gripper (raw/10): < thresh -> 0 (closed), else -> 85 (open/max).
-    Mirrors upstream YAM's DreamZeroJointPosClient (snaps gripper at 0.5 on its [0,1] scale).
-    Pass-through (continuous) when BINARIZE_GRIP is False (--no-gripper-binary)."""
-    if not BINARIZE_GRIP:
-        return g
+    """Binary gripper (raw/10): < GRIPPER_CLOSE_THRESH -> 0 (closed), else -> 85 (open/max).
+    Mirrors upstream YAM's DreamZeroJointPosClient (snaps the gripper at 0.5 on its [0,1] scale)."""
     return 0.0 if g < GRIPPER_CLOSE_THRESH else 85.0
+
+
+def _round_grip(g: float, step: float) -> float:
+    """Quantize the continuous gripper (raw/10) by rounding DOWN to a multiple of step (e.g.
+    step=10: 32->30, 26->20, 84->80). Floor (not nearest) so the gripper biases toward CLOSE
+    (smaller raw/10 = more closed) -> firmer grasps. Snaps out sub-step jitter, graded gripper."""
+    return float(np.floor(g / step) * step)
+
+
+def _grip_command(g: float) -> float:
+    """Map the model's raw/10 gripper prediction to the value sent to the arm. Dispatches to the
+    active gripper option, in precedence order:
+      1. BINARIZE_GRIP          -> _binarize_grip: decisive 0/85 (grasp). DEFAULT.
+      2. GRIPPER_ROUND_STEP > 0 -> _round_grip:    graded, quantized to the step.
+      3. else                   -> continuous pass-through (matches training)."""
+    if BINARIZE_GRIP:
+        return _binarize_grip(g)
+    if GRIPPER_ROUND_STEP > 0:
+        return _round_grip(g, GRIPPER_ROUND_STEP)
+    return g
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +197,9 @@ def _apply_arm_action(
 ) -> None:
     """Send 14-D action to both arms (non-blocking)."""
     left_joints  = action[0:6].tolist()
-    left_grip    = _binarize_grip(float(action[6]))    # gripper binary by default (raw/10); --no-gripper-binary for continuous
+    left_grip    = _grip_command(float(action[6]))    # gripper: binary by default; --no-gripper-binary [+ --gripper-round-step]
     right_joints = action[7:13].tolist()
-    right_grip   = _binarize_grip(float(action[13]))
+    right_grip   = _grip_command(float(action[13]))
 
     left_arm.set_servo_angle(
         angle=left_joints, is_radian=True, wait=False,
@@ -287,6 +311,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gripper-binary", action=argparse.BooleanOptionalAction, default=True,
                    help="Binarize the gripper into open/close at --gripper-close-thresh. Default OFF: "
                         "send the raw continuous predicted gripper value (matches training).")
+    p.add_argument("--gripper-round-step", type=float, default=0.0,
+                   help="Continuous mode only (--no-gripper-binary): round the predicted gripper "
+                        "(raw/10) DOWN to a multiple of this step, e.g. 10 -> 32->30, 26->20, "
+                        "84->80. Floor biases toward close (firmer grasp). Snaps out sub-step jitter "
+                        "while keeping a graded gripper. 0 = off. Ignored when --gripper-binary is on.")
 
     return p.parse_args()
 
@@ -297,12 +326,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    global GRIPPER_CLOSE_THRESH, BINARIZE_GRIP
+    global GRIPPER_CLOSE_THRESH, BINARIZE_GRIP, GRIPPER_ROUND_STEP
     GRIPPER_CLOSE_THRESH = args.gripper_close_thresh
     BINARIZE_GRIP = args.gripper_binary  # binary is the DEFAULT (--no-gripper-binary for continuous)
-    logger.info("Gripper: %s",
-                f"BINARY (open/close at thresh {GRIPPER_CLOSE_THRESH:.0f} raw/10)"
-                if BINARIZE_GRIP else "continuous (q99 prediction passed through)")
+    GRIPPER_ROUND_STEP = max(0.0, args.gripper_round_step)
+    if BINARIZE_GRIP:
+        grip_desc = f"BINARY (open/close at thresh {GRIPPER_CLOSE_THRESH:.0f} raw/10)"
+    elif GRIPPER_ROUND_STEP > 0:
+        grip_desc = f"continuous, rounded DOWN to multiple of {GRIPPER_ROUND_STEP:.0f} (raw/10)"
+    else:
+        grip_desc = "continuous (q99 prediction passed through)"
+    logger.info("Gripper: %s", grip_desc)
+    if BINARIZE_GRIP and GRIPPER_ROUND_STEP > 0:
+        logger.warning("--gripper-round-step=%.0f ignored: --gripper-binary is on "
+                       "(binary already snaps to 0/85). Use --no-gripper-binary to round.",
+                       GRIPPER_ROUND_STEP)
     if BINARIZE_GRIP and GRIPPER_CLOSE_THRESH > 37:
         logger.warning("gripper-close-thresh=%.0f > ~37 (q99 open cap): releases from closed may "
                        "NEVER trigger 'open'. Consider --gripper-close-thresh 25-30.",
@@ -530,8 +568,8 @@ def main() -> None:
                         "gripL act=%s pred=%.1f cmd=%d  gripR act=%s pred=%.1f cmd=%d",
                         iteration, infer_ms,
                         np.degrees(left_jump_rad), np.degrees(right_jump_rad),
-                        la_now, float(action[6]),  int(_binarize_grip(float(action[6]))  * 10.0),
-                        ra_now, float(action[13]), int(_binarize_grip(float(action[13])) * 10.0),
+                        la_now, float(action[6]),  int(_grip_command(float(action[6]))  * 10.0),
+                        ra_now, float(action[13]), int(_grip_command(float(action[13])) * 10.0),
                     )
 
             # Rate limiting
