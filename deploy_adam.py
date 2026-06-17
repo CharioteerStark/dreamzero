@@ -55,6 +55,12 @@ BINARIZE_GRIP = True
 # still flips 20<->30 step-to-step -> use hysteresis for boundary chatter, not rounding.
 GRIPPER_ROUND_STEP = 0.0
 
+# JPEG observation compression (remote/WAN serving). When on, camera frames are JPEG-encoded
+# before sending so the per-call payload is ~10x smaller (~2 MB raw RGB -> ~200 KB), cutting the
+# websocket round-trip and therefore the RTC inference delay d (enabling more frequent replanning).
+JPEG_OBS = False
+JPEG_QUALITY = 90
+
 
 def _binarize_grip(g: float) -> float:
     """Binary gripper (raw/10): < GRIPPER_CLOSE_THRESH -> 0 (closed), else -> 85 (open/max).
@@ -80,6 +86,14 @@ def _grip_command(g: float) -> float:
     if GRIPPER_ROUND_STEP > 0:
         return _round_grip(g, GRIPPER_ROUND_STEP)
     return g
+
+
+def _jpeg_encode(rgb: np.ndarray) -> bytes:
+    """Encode an (H, W, 3) RGB frame to JPEG bytes. Convert RGB->BGR first so a standard cv2 JPEG
+    round-trip (server does imdecode -> BGR2RGB) reconstructs the same RGB the raw path would send."""
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    return buf.tobytes() if ok else rgb  # fallback to raw array (server handles ndarray)
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +339,15 @@ def parse_args() -> argparse.Namespace:
                         "84->80. Floor biases toward close (firmer grasp). Snaps out sub-step jitter "
                         "while keeping a graded gripper. 0 = off. Ignored when --gripper-binary is on.")
 
+    # Observation transport
+    p.add_argument("--jpeg-obs", action="store_true",
+                   help="JPEG-compress camera frames before sending (remote/WAN serving). Cuts the "
+                        "per-call payload ~10x (~2MB raw RGB -> ~200KB), shrinking the websocket "
+                        "round-trip and the RTC delay d -> more frequent replanning. Server decodes "
+                        "transparently; raw is still accepted if off.")
+    p.add_argument("--jpeg-quality", type=int, default=90,
+                   help="JPEG quality (1-100) for --jpeg-obs. Default 90 (near-lossless, ~200KB/frame).")
+
     return p.parse_args()
 
 
@@ -334,10 +357,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    global GRIPPER_CLOSE_THRESH, BINARIZE_GRIP, GRIPPER_ROUND_STEP
+    global GRIPPER_CLOSE_THRESH, BINARIZE_GRIP, GRIPPER_ROUND_STEP, JPEG_OBS, JPEG_QUALITY
     GRIPPER_CLOSE_THRESH = args.gripper_close_thresh
     BINARIZE_GRIP = args.gripper_binary  # binary is the DEFAULT (--no-gripper-binary for continuous)
     GRIPPER_ROUND_STEP = max(0.0, args.gripper_round_step)
+    JPEG_OBS = args.jpeg_obs
+    JPEG_QUALITY = int(args.jpeg_quality)
+    if JPEG_OBS:
+        logger.info("Obs images: JPEG-compressed (quality=%d) to cut WAN round-trip / RTC delay d.", JPEG_QUALITY)
     if BINARIZE_GRIP:
         grip_desc = f"BINARY (open/close at thresh {GRIPPER_CLOSE_THRESH:.0f} raw/10)"
     elif GRIPPER_ROUND_STEP > 0:
@@ -472,6 +499,8 @@ def main() -> None:
                 r = _r if r is None else r
                 lj, lg = _read_arm_state(left_arm, "left")
                 rj, rg = _read_arm_state(right_arm, "right")
+                if JPEG_OBS:
+                    h, l, r = _jpeg_encode(h), _jpeg_encode(l), _jpeg_encode(r)
                 return {
                     "observation/head_left":   h,
                     "observation/left_wrist":  l,

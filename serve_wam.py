@@ -173,6 +173,14 @@ class AdamWanPolicy:
 
         for wire_key, wan_key in image_key_mapping.items():
             frame = obs[wire_key]
+            # JPEG-compressed obs (remote/WAN serving): the client may send JPEG bytes instead of a
+            # raw RGB array to cut per-call transport (~2 MB -> ~200 KB) and thus the round-trip / d.
+            # Decode back to RGB here. Raw ndarrays pass straight through (backward compatible).
+            if isinstance(frame, (bytes, bytearray)):
+                bgr = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR)
+                if bgr is None:
+                    raise ValueError(f"Failed to JPEG-decode {wire_key}")
+                frame = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             if not isinstance(frame, np.ndarray):
                 frame = np.asarray(frame)
             if frame.ndim == 3:
