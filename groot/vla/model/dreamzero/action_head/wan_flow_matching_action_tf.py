@@ -1420,7 +1420,16 @@ class WANPolicyHead(ActionHead):
             self.vae.model.encode = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.vae.model.encode)
-        
+
+            # Experimental (COMPILE_DIT=true): also compile the DiT block loop — the ~0.3s/step
+            # diffusion compute, which is otherwise EAGER (the biggest un-optimized cost). fullgraph
+            # fails on the x-vs-e shape variation noted above, so use dynamic=True + fullgraph=False
+            # (default mode — cudagraphs/reduce-overhead are incompatible with dynamic shapes). Off
+            # by default; toggle COMPILE_DIT=true to try it. Non-TRT path only (TRT replaces the DiT).
+            if os.getenv("COMPILE_DIT", "False").lower() == "true":
+                print("Torch compiling the DiT _forward_blocks (dynamic=True, fullgraph=False) [experimental].")
+                self.model._forward_blocks = torch.compile(dynamic=True, fullgraph=False)(self.model._forward_blocks)
+
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:
             print(f"Loading TRT engine from {LOAD_TRT_ENGINE}")
