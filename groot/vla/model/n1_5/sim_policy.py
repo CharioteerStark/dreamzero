@@ -455,6 +455,22 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         eval_transform.eval()
         self.eval_transform = eval_transform
 
+        # RTC (real-time chunking, arXiv:2506.07339): cache per-key action q01/q99 so we can
+        # reconstruct a committed-action prefix (absolute units, sent by the client) into the
+        # model's q99-normalised RELATIVE action space, to use as an inpainting target. Only 1-D
+        # (non per-horizon) stats are cached — Adam uses relative_action (not per-horizon).
+        self._rtc_action_stats = {}
+        try:
+            _astats = metadata.statistics.action
+            for _k in list(_astats.keys()):
+                _d = _astats[_k].model_dump()
+                _q01 = np.asarray(_d.get("q01"), dtype=np.float32)
+                _q99 = np.asarray(_d.get("q99"), dtype=np.float32)
+                if _q01.ndim == 1 and _q01.shape == _q99.shape:
+                    self._rtc_action_stats[_k] = (_q01, _q99)
+        except Exception as _e:
+            print(f"[RTC] action-stat cache skipped ({_e}); RTC inpainting will be disabled.")
+
         # 3. Load horizons needed
         if self.embodiment_tag.value in train_cfg.modality_configs:
             self.modality_configs = instantiate(
@@ -676,12 +692,98 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             batch.act = squeeze_dict_values(batch.act)
         return batch, video_pred
 
+    def _rtc_last_state(self, obs, key: str, dim: int) -> np.ndarray:
+        """Per-call relative baseline for one action key: the last-timestep state vector.
+        Mirrors unapply()'s relative->absolute logic (absolute = relative + last_state)."""
+        v = obs.get(f"state.{key}")
+        if v is None:
+            return np.zeros(dim, dtype=np.float32)
+        if torch.is_tensor(v):
+            v = v.detach().cpu().numpy()
+        v = np.asarray(v, dtype=np.float32)
+        v = np.squeeze(v)
+        if v.ndim >= 2:
+            v = v[..., -1, :]
+        return np.reshape(v, (-1,))[:dim]
+
+    def _build_rtc_target(self, rtc_prefix, rtc_delay, obs):
+        """Reconstruct a Real-Time-Chunking inpainting target from a committed-action prefix.
+
+        rtc_prefix: (L,14) or (1,L,14) ABSOLUTE [L-joint(6),L-grip(1),R-joint(6),R-grip(1)].
+        rtc_delay : int d — number of leading steps to hard-freeze (already executing during
+                    the inference delay). The prefix length L defines the overlap (guided) region.
+        obs       : per-call observation (carries state.<key>, the relative baseline).
+
+        Returns (target, weight, joint_mask):
+          target     (1,H,Dpad) bf16 cuda — q99-normalised RELATIVE actions, padded; clean (x0).
+          weight     (1,H,1)    bf16 cuda — soft mask W: 1 for i<d, exp-decay over [d,L), 0 after.
+          joint_mask (1,1,Dpad) bool cuda — True on the 12 joint dims only (grippers/pad untouched).
+        Raises on malformed input so the caller can fall back to vanilla inference.
+        """
+        prefix = np.squeeze(np.asarray(rtc_prefix, dtype=np.float32))
+        if prefix.ndim == 1:
+            prefix = prefix[None, :]
+        assert prefix.shape[-1] == 14, f"rtc_prefix last dim must be 14, got {prefix.shape}"
+        ah = self.trained_model.action_head
+        H = int(ah.action_horizon)
+        Dpad = int(ah.model.action_dim)
+        L = min(int(prefix.shape[0]), H)
+        prefix = prefix[:L]
+        d = int(np.clip(int(rtc_delay), 0, L))
+
+        # 14-D wire layout -> the 4 relative keys (matches ConcatTransform action_concat_order).
+        key_slices = [
+            ("left_joint_pos",    slice(0, 6)),
+            ("left_gripper_pos",  slice(6, 7)),
+            ("right_joint_pos",   slice(7, 13)),
+            ("right_gripper_pos", slice(13, 14)),
+        ]
+        norm_cols = np.zeros((L, 14), dtype=np.float32)
+        for key, sl in key_slices:
+            stat = self._rtc_action_stats.get(key)
+            if stat is None:
+                continue  # leave 0 (only joint dims are used downstream)
+            q01, q99 = stat
+            last_state = self._rtc_last_state(obs, key, sl.stop - sl.start)
+            rel = prefix[:, sl] - last_state[None, :]
+            span = q99 - q01
+            m = span != 0
+            nz = np.zeros_like(rel)
+            nz[:, m] = 2.0 * (rel[:, m] - q01[None, m]) / span[None, m] - 1.0
+            norm_cols[:, sl] = np.clip(nz, -1.0, 1.0)
+
+        target = np.zeros((H, Dpad), dtype=np.float32)
+        target[:L, :14] = norm_cols
+
+        # Soft mask (RTC Eq.5): hard-freeze [0,d), exp decay over the overlap [d,L), free after.
+        w = np.zeros((H,), dtype=np.float32)
+        w[: min(d, H)] = 1.0
+        denom = max(L - d + 1, 1)
+        for i in range(d, min(L, H)):
+            c = (L - i) / denom
+            w[i] = c * (np.exp(c) - 1.0) / (np.e - 1.0)
+
+        jm = np.zeros((Dpad,), dtype=bool)
+        for j in (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12):  # joints only; grippers 6,13 excluded
+            jm[j] = True
+
+        t_target = torch.from_numpy(target)[None].to(device="cuda", dtype=torch.bfloat16)
+        t_weight = torch.from_numpy(w)[None, :, None].to(device="cuda", dtype=torch.bfloat16)
+        t_mask = torch.from_numpy(jm)[None, None, :].to(device="cuda")
+        return t_target, t_weight, t_mask
+
     def lazy_joint_forward_causal(self, batch, video=None, latent_video=None, state=None, video_only=False, **kwargs):
         
         transform_start_time = time.perf_counter()
 
+        # RTC (real-time chunking): pull the committed-action prefix + inference delay out of the
+        # obs BEFORE any transform/unsqueeze. They ride the obs broadcast, so every tensor-parallel
+        # rank sees them and reconstructs the SAME inpainting target (no rank-0-only state).
+        rtc_prefix = batch.obs.pop("rtc_prefix", None)
+        rtc_delay = batch.obs.pop("rtc_delay", None)
+
         # Save original observation before any modification (for relative action conversion)
-        original_obs_for_relative = {k: v.copy() if isinstance(v, np.ndarray) else v.clone() if torch.is_tensor(v) else v 
+        original_obs_for_relative = {k: v.copy() if isinstance(v, np.ndarray) else v.clone() if torch.is_tensor(v) else v
                                      for k, v in batch.obs.items()}
 
         # 1. Check if input is batched and add batch dimension if needed
@@ -709,6 +811,20 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         for k, v in normalized_input.items():
             if torch.is_tensor(v) and v.dtype == torch.float32 and self.eval_bf16:
                 normalized_input[k] = v.to(dtype=torch.bfloat16)
+
+        # RTC: set (or clear) the inpainting target on the action head for THIS forward. Cleared
+        # to None on every non-RTC call so a target never leaks into a later vanilla inference.
+        _ah = getattr(self.trained_model, "action_head", None)
+        if _ah is not None:
+            if rtc_prefix is not None and rtc_delay is not None and getattr(self, "_rtc_action_stats", None):
+                try:
+                    _t, _w, _m = self._build_rtc_target(rtc_prefix, rtc_delay, original_obs_for_relative)
+                    _ah._rtc_target, _ah._rtc_weight, _ah._rtc_joint_mask = _t, _w, _m
+                except Exception as _e:
+                    print(f"[RTC] target build failed -> vanilla inference this step: {_e}")
+                    _ah._rtc_target = _ah._rtc_weight = _ah._rtc_joint_mask = None
+            else:
+                _ah._rtc_target = _ah._rtc_weight = _ah._rtc_joint_mask = None
 
         model_start_time = time.perf_counter()
 

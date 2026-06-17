@@ -270,6 +270,16 @@ class AdamWanPolicy:
         """Inference entry point. Returns a dict; the transport adds server_timing."""
         converted_obs = self._convert_observation(obs)
 
+        # RTC (real-time chunking): pass the client's committed-action prefix (absolute, (L,14))
+        # and inference delay d into the converted obs so they ride the existing rank broadcast to
+        # every tensor-parallel worker. The action head reconstructs + applies the inpainting
+        # target identically on all ranks. Absent -> vanilla inference (byte-identical).
+        rtc_prefix = obs.get("rtc_prefix")
+        rtc_delay = obs.get("rtc_delay")
+        if rtc_prefix is not None and rtc_delay is not None:
+            converted_obs["rtc_prefix"] = np.asarray(rtc_prefix, dtype=np.float32)
+            converted_obs["rtc_delay"] = int(rtc_delay)
+
         # Signal worker ranks to participate in this forward pass.
         signal_tensor = torch.tensor([_SIGNAL_CONTINUE], dtype=torch.int32, device="cpu")
         dist.broadcast(signal_tensor, src=0, group=self._signal_group)
@@ -294,7 +304,16 @@ class AdamWanPolicy:
         }
         actions = self._convert_action(action_dict)
         # Shape: (action_horizon=24, 14).
-        return {"actions": actions}
+        result = {"actions": actions}
+        # Per-component model timing (text/image encoder, VAE, KV cache, per-step diffusion,
+        # scheduler), stashed by the action head. Shipped to the client so the deploy log can
+        # break down where the ~inference time goes.
+        model_timing = getattr(
+            getattr(self._policy.trained_model, "action_head", None), "last_inference_timing", None
+        )
+        if model_timing is not None:
+            result["model_timing"] = model_timing
+        return result
 
     def _actual_grid(self, converted_obs: dict) -> np.ndarray:
         """Build the 2x2 grid of the ACTUAL observed frame (RGB), matching the model's layout
@@ -424,6 +443,10 @@ class WamWebsocketServer:
                 action["server_timing"] = {"infer_ms": infer_ms}
                 if prev_total_time is not None:
                     action["server_timing"]["prev_total_ms"] = prev_total_time * 1000.0
+                # Fold the per-component model breakdown under server_timing.model.
+                model_timing = action.pop("model_timing", None)
+                if model_timing is not None:
+                    action["server_timing"]["model"] = model_timing
 
                 await websocket.send(packer.pack(action))
                 prev_total_time = time.monotonic() - start_time

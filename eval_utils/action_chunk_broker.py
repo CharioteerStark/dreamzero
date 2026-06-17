@@ -91,6 +91,8 @@ class AsyncActionChunkBroker:
         reanchor: bool = True,
         reanchor_skip: int = 2,
         chunk_tail_skip: int = 0,
+        rtc: bool = False,
+        inference_freq: float | None = None,
     ) -> None:
         self._policy = policy
         self._action_horizon = action_horizon
@@ -134,7 +136,40 @@ class AsyncActionChunkBroker:
         self._inflight = threading.Event()
         self._gen = 0   # bumped by force_replan() to invalidate in-flight (stale-obs) inferences
         self._infer_lock = threading.Lock()   # serialize policy.infer(): one ws.recv() at a time
-        self._last_recalc_t: float | None = None   # for closed-loop (fresh-obs recalculation) rate
+        # server-reported model forward-pass time (ms) of the most recent COMPLETED fetch — the
+        # pure inference time per chunk (no deploy-side playback, no network wait). The inference
+        # rate is 1/infer_s; logged per chunk in _fetch.
+        self._last_infer_ms: float | None = None
+        # bumped once per completed fetch (a fresh plan). The deploy client watches this to detect
+        # a replan and time the execution (open-loop) phase between plans.
+        self._fetch_count: int = 0
+
+        # ── Real-Time Chunking (RTC, arXiv:2506.07339) ──────────────────────────────────────
+        # Continuous async execution with prefix-inpainting: the next chunk is generated WHILE the
+        # current one executes, conditioned on the committed leftover so it is continuous at the
+        # seam (server does the inpainting). No reanchor / no Savitzky-Golay smoothing — RTC owns
+        # continuity. Indices are tracked on an absolute timeline (_t) so a returned chunk can be
+        # spliced at the position its observation was captured.
+        self._rtc = rtc
+        self._inference_freq = inference_freq
+        self._t = 0                     # absolute control tick of the NEXT action to emit
+        self._chunk_base_t = 0          # timeline tick that maps to self._chunk[0]
+        self._next_base_t = 0           # timeline tick that maps to self._next_chunk[0]
+        self._rtc_d = 1                 # measured inference delay in control steps (adapts)
+        self._rtc_wall_ema: float | None = None   # EMA of obs->chunk wall-clock (seconds)
+
+    @property
+    def last_server_infer_ms(self) -> float | None:
+        """Server-reported forward-pass time (ms) of the most recent fetch, or None. Lets the
+        deploy client log the TRUE inference time instead of the broker round-trip (which is
+        ~0 ms on the cached, non-replan ticks in sync mode)."""
+        return self._last_infer_ms
+
+    @property
+    def fetch_count(self) -> int:
+        """Number of completed fetches (fresh plans) so far. Increments on every inference;
+        the deploy client diffs it to detect a replan and time the execution phase between plans."""
+        return self._fetch_count
 
     def get_action(self, obs_fn: Callable[[], dict]) -> np.ndarray:
         """Return next (14,) action.
@@ -144,6 +179,10 @@ class AsyncActionChunkBroker:
                     Called only at chunk boundaries to feed the next inference.
                     Calling it every step is fine — it's cheap.
         """
+        # ── RTC mode: continuous async with prefix-inpainting (owns its own path) ──
+        if self._rtc:
+            return self._get_action_rtc(obs_fn)
+
         # ── Sync mode: YAM-style receding horizon ───────────────────────────
         # Mirrors upstream DreamZeroJointPosClient.infer: replan from a FRESH observation
         # every open_loop_horizon steps (blocking), then execute chunk[step]. Each chunk is
@@ -224,30 +263,39 @@ class AsyncActionChunkBroker:
             return min(self._reanchor_skip, self._chunk.shape[0] - 1)
         return 0
 
-    def _log_closed_loop(self) -> None:
-        """Closed-loop rate = how often the model recalculates a brand-new plan from FRESH camera
-        feedback (one fresh-obs inference). Called at the start of each _fetch; the period is
-        dominated by the inference time (so it reads ~1/inference_time)."""
-        now = time.monotonic()
-        if self._last_recalc_t is not None:
-            dt = now - self._last_recalc_t
-            logger.info("[closed-loop] %.2f Hz (recalculated a new plan from fresh obs every %.2fs)",
-                        (1.0 / dt if dt > 0 else 0.0), dt)
-        self._last_recalc_t = now
-
     def _advance(self) -> np.ndarray:
         action = self._chunk[self._step].copy()
         self._step += 1
         return self._reanchor_action(action)
 
     def _fetch(self, obs: dict) -> np.ndarray:
-        self._log_closed_loop()   # a fresh-obs recalculation (brand-new plan) starts here
         # Single websocket -> only one infer (send+recv) at a time. Without this, a force_replan
         # cold-start fetch on the main thread races the in-flight background prefetch -> recv() on
         # the same socket from two threads -> ConcurrencyError. The main thread waits here for the
         # in-flight (stale) inference to finish; its result is then dropped by the _gen guard.
         with self._infer_lock:
             result = self._policy.infer(obs)
+        self._fetch_count += 1
+        # Server-reported model forward-pass time (ms) for THIS chunk. Logged per chunk as the
+        # inference rate (1/infer_s) — pure model time, no deploy playback / network wait.
+        st = result.get("server_timing") if isinstance(result, dict) else None
+        if st is not None and "infer_ms" in st:
+            self._last_infer_ms = float(st["infer_ms"])
+            infer_s = self._last_infer_ms / 1000.0
+            logger.info("[infer] %.2f Hz (model inference %.2fs / chunk)",
+                        (1.0 / infer_s if infer_s > 0 else 0.0), infer_s)
+            # Per-component breakdown (where the inference time goes), incl. each denoise step.
+            m = st.get("model")
+            if m:
+                steps = "+".join(f"{x:.0f}" for x in m.get("diffusion_steps_ms", []))
+                logger.info(
+                    "[infer]   text_enc %.0fms  img_enc %.0fms  vae %.0fms  kv %.0fms  "
+                    "diffusion %.0fms = [%s]ms (%d DIT steps)  sched %.0fms  total %.0fms",
+                    m.get("text_encoder_ms", 0.0), m.get("image_encoder_ms", 0.0),
+                    m.get("vae_ms", 0.0), m.get("kv_creation_ms", 0.0),
+                    m.get("diffusion_ms", 0.0), steps, m.get("dit_compute_steps", 0),
+                    m.get("scheduler_ms", 0.0), m.get("total_ms", 0.0),
+                )
         actions = np.asarray(result["actions"], dtype=np.float32)
         if actions.ndim == 1:
             actions = actions[np.newaxis, :]
@@ -286,6 +334,113 @@ class AsyncActionChunkBroker:
             logger.exception("Background inference failed.")
         finally:
             self._inflight.clear()
+
+    # ── Real-Time Chunking path ─────────────────────────────────────────────────────────
+    def _get_action_rtc(self, obs_fn: Callable[[], dict]) -> np.ndarray:
+        """RTC: continuous async execution. The next chunk is generated while the current one
+        plays, conditioned (server-side inpainting) on the committed leftover so the seam is
+        continuous. Chunks are aligned on an absolute timeline (_t); a returned chunk is spliced
+        at the tick its observation was captured (its frozen prefix == what just executed)."""
+        H = self._action_horizon
+
+        # Cold start: blocking VANILLA inference (no prefix yet), then kick the first prefetch.
+        if self._chunk is None:
+            logger.info("RTC cold-start inference (blocking, no prefix)...")
+            self._t = 0
+            obs = obs_fn()
+            self._chunk = self._fetch_rtc(obs, prefix=None, d=0)
+            self._chunk_base_t = 0
+            self._launch_rtc_fetch(obs_fn)
+            return self._emit_rtc()
+
+        # Splice in a ready prefetched chunk, aligned by the tick its obs was captured at.
+        with self._next_lock:
+            if self._next_chunk is not None:
+                idx = self._t - self._next_base_t
+                if 0 <= idx < H:
+                    self._chunk = self._next_chunk
+                    self._chunk_base_t = self._next_base_t
+                    self._next_chunk = None
+                    logger.debug("RTC splice at idx=%d (d=%d).", idx, self._rtc_d)
+                    self._launch_rtc_fetch(obs_fn)   # immediately prefetch the next chunk
+                else:
+                    # Catastrophically slow/fast inference -> chunk out of range; drop & refetch.
+                    self._next_chunk = None
+                    self._launch_rtc_fetch(obs_fn)
+
+        if self._t - self._chunk_base_t >= H:
+            # Ran out before the next chunk was ready -> hold last action; ensure a fetch is queued.
+            self._launch_rtc_fetch(obs_fn)
+            return self._chunk[-1].copy()
+        return self._emit_rtc()
+
+    def _emit_rtc(self) -> np.ndarray:
+        idx = int(np.clip(self._t - self._chunk_base_t, 0, self._action_horizon - 1))
+        action = self._chunk[idx].copy()
+        self._t += 1
+        return action
+
+    def _launch_rtc_fetch(self, obs_fn: Callable[[], dict]) -> None:
+        if self._inflight.is_set():
+            return
+        self._inflight.set()
+        base_t = self._t            # obs captured ~now corresponds to this timeline tick
+        idx = self._t - self._chunk_base_t
+        if self._chunk is not None and 0 <= idx < self._action_horizon:
+            prefix = self._chunk[idx:].copy()    # committed leftover (absolute), (H-idx, 14)
+        else:
+            prefix = None
+        gen = self._gen
+        t = threading.Thread(target=self._rtc_bg,
+                             args=(obs_fn, base_t, prefix, self._rtc_d, gen),
+                             daemon=True, name="rtc_bg")
+        t.start()
+
+    def _rtc_bg(self, obs_fn: Callable[[], dict], base_t: int, prefix, d: int, gen: int) -> None:
+        try:
+            obs = obs_fn()
+            chunk = self._fetch_rtc(obs, prefix=prefix, d=d)
+            with self._next_lock:
+                if gen == self._gen:
+                    self._next_chunk = chunk
+                    self._next_base_t = base_t
+                else:
+                    logger.debug("Discarding stale RTC chunk (gen %d != %d).", gen, self._gen)
+        except Exception:
+            logger.exception("RTC background inference failed.")
+        finally:
+            self._inflight.clear()
+
+    def _fetch_rtc(self, obs: dict, prefix, d: int) -> np.ndarray:
+        """Like _fetch but (a) attaches the RTC committed prefix + delay to the obs, and
+        (b) measures the obs->chunk WALL-CLOCK to adapt d = ceil(EMA(wall) * inference_freq)."""
+        if prefix is not None and len(prefix) > 0:
+            obs = dict(obs)
+            obs["rtc_prefix"] = np.asarray(prefix, dtype=np.float32)
+            obs["rtc_delay"] = int(d)
+        t0 = time.monotonic()
+        with self._infer_lock:
+            result = self._policy.infer(obs)
+        wall = time.monotonic() - t0
+        self._fetch_count += 1
+        if self._inference_freq:
+            self._rtc_wall_ema = (wall if self._rtc_wall_ema is None
+                                  else 0.7 * self._rtc_wall_ema + 0.3 * wall)
+            new_d = int(np.ceil(self._rtc_wall_ema * self._inference_freq))
+            self._rtc_d = int(np.clip(new_d, 1, self._action_horizon - 1))
+            if self._rtc_d > self._action_horizon // 2:
+                logger.warning("[rtc] d=%d > H/2=%d: inference too slow for this control rate; "
+                               "seam continuity degrades (lower --inference-freq or speed up the model).",
+                               self._rtc_d, self._action_horizon // 2)
+        st = result.get("server_timing") if isinstance(result, dict) else None
+        if st is not None and "infer_ms" in st:
+            self._last_infer_ms = float(st["infer_ms"])
+            logger.info("[rtc] wall=%.2fs d=%d (server %.2fs)",
+                        wall, self._rtc_d, self._last_infer_ms / 1000.0)
+        actions = np.asarray(result["actions"], dtype=np.float32)
+        if actions.ndim == 1:
+            actions = actions[np.newaxis, :]
+        return actions
 
     def force_replan(self) -> None:
         """Abandon the active (and pre-fetched) chunk so the next get_action() regenerates from a

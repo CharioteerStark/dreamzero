@@ -1205,9 +1205,18 @@ class WANPolicyHead(ActionHead):
             num_train_timesteps=self.scheduler.num_train_timesteps,
             shift=1,
             use_dynamic_shifting=False)
+        # Real-Time Chunking (RTC, arXiv:2506.07339): when the policy wrapper has set an
+        # inpainting target on this head, run the ACTION solver at order 1 (no multistep
+        # corrector). Per-step prefix inpainting injects a sample inconsistent with the solver's
+        # own history; at order 2 the corrector's self-consistency assumption is violated and can
+        # destabilise the FREE (future) action dims ("smooth prefix, garbage tail"). Order 1 is
+        # ~Euler — fine at these few steps and safe for a real arm. Non-RTC path is unchanged
+        # (order 2 default), so behaviour is byte-identical when no target is set.
+        _rtc_active = getattr(self, "_rtc_target", None) is not None
         sample_scheduler_action = FlowUniPCMultistepScheduler(
             num_train_timesteps=self.scheduler.num_train_timesteps,
             shift=1,
+            solver_order=(1 if _rtc_active else 2),
             use_dynamic_shifting=False)
         sample_scheduler.set_timesteps(
             self.num_inference_steps, device=noise_obs.device, shift=self.sigma_shift)
@@ -1309,6 +1318,22 @@ class WANPolicyHead(ActionHead):
                 return_dict=False,
             )[0]
 
+            # ── RTC inpainting (real-time chunking) ──────────────────────────────────────
+            # Pin a prefix of the action chunk to the committed trajectory so the next chunk
+            # is continuous with what the robot is already executing. RePaint-style: after each
+            # action denoise step, overwrite the masked prefix with the target forward-diffused
+            # to THIS step's noise level (sigmas[index+1]), blended by the soft-mask weight.
+            # _rtc_target (B,H,action_dim, q99-normalised relative, clean), _rtc_weight (B,H,1),
+            # _rtc_joint_mask (1,1,action_dim bool, joints only) are set on this head by the
+            # policy wrapper before the call; all share noisy_input_action's device/dtype. We
+            # reuse the SAME init noise_action so the frozen trajectory is deterministic, and
+            # apply ONLY to joint dims (grippers + padding keep the model's free output).
+            if _rtc_active:
+                sigma_next = sample_scheduler_action.sigmas[index + 1].to(noisy_input_action.dtype)
+                tgt_noised = (1.0 - sigma_next) * self._rtc_target + sigma_next * noise_action
+                blended = self._rtc_weight * tgt_noised + (1.0 - self._rtc_weight) * noisy_input_action
+                noisy_input_action = torch.where(self._rtc_joint_mask, blended, noisy_input_action)
+
         latents = noisy_input
         latents_action = noisy_input_action
         output = latents
@@ -1326,9 +1351,24 @@ class WANPolicyHead(ActionHead):
         image_encoder_time = start_image_encoder_event.elapsed_time(end_image_encoder_event) / 1000
         vae_time = start_vae_event.elapsed_time(end_vae_event) / 1000
         kv_creation_time = start_kv_event.elapsed_time(end_kv_event) / 1000
-        diffusion_times = [s.elapsed_time(e) for s, e in zip(start_diffusion_events, end_diffusion_events)]
+        diffusion_times = [s.elapsed_time(e) for s, e in zip(start_diffusion_events, end_diffusion_events)]  # ms each
         diffusion_time = sum(diffusion_times) / 1000
         scheduler_time = total_time - kv_creation_time - diffusion_time - text_encoder_time - image_encoder_time - vae_time
+
+        # Expose the per-component breakdown so the inference server can ship it to the deploy
+        # client (it was previously only printed on rank 0). All values in ms; diffusion_steps_ms
+        # is one entry PER denoise step (≈0 on cached/skipped steps).
+        self.last_inference_timing = {
+            "total_ms": total_time * 1000.0,
+            "text_encoder_ms": text_encoder_time * 1000.0,
+            "image_encoder_ms": image_encoder_time * 1000.0,
+            "vae_ms": vae_time * 1000.0,
+            "kv_creation_ms": kv_creation_time * 1000.0,
+            "diffusion_ms": diffusion_time * 1000.0,
+            "diffusion_steps_ms": [round(float(t), 2) for t in diffusion_times],
+            "dit_compute_steps": int(dit_compute_steps),
+            "scheduler_ms": scheduler_time * 1000.0,
+        }
 
         if self.ip_rank == 0:
             print(f"Time taken: Total {total_time:.2f} seconds, "

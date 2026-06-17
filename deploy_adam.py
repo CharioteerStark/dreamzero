@@ -272,6 +272,14 @@ def parse_args() -> argparse.Namespace:
                    help="Use the async pre-fetch broker (executes the full chunk, no inference "
                         "holds -> smooth). Pair with --reanchor (default on) to avoid the "
                         "stale-anchor snap-back oscillation.")
+    p.add_argument("--rtc", action="store_true",
+                   help="Real-Time Chunking (arXiv:2506.07339): continuous async execution where "
+                        "the next chunk is generated WHILE the current plays, conditioned on the "
+                        "committed leftover so the seam is continuous (server inpaints the frozen "
+                        "prefix). Supersedes sync/async; ignores --reanchor/--smooth-window (RTC "
+                        "owns continuity). The inference delay d is measured live; needs d <= "
+                        "chunk_size/2 for a real overlap, so keep --inference-freq low enough "
+                        "(d = ceil(latency * inference_freq)). REQUIRES a server built with RTC.")
     p.add_argument("--reanchor", action=argparse.BooleanOptionalAction, default=False,
                    help="Async only: re-base each pre-fetched chunk's joint targets to the LIVE "
                         "pose at activation (cmd = chunk - chunk[0] + current_state). Removes the "
@@ -406,11 +414,16 @@ def main() -> None:
                                     smooth_window=args.smooth_window, sync=sync,
                                     open_loop_horizon=args.open_loop_horizon,
                                     reanchor=args.reanchor, reanchor_skip=args.reanchor_skip,
-                                    chunk_tail_skip=args.chunk_tail_skip)
-    logger.info("Policy connected (chunk_size=%d, open_loop_horizon=%d, mode=%s%s).",
-                args.chunk_size, args.open_loop_horizon,
-                "async-prefetch" if args.async_prefetch else "sync receding-horizon (YAM-aligned)",
-                f", reanchor={args.reanchor}" if args.async_prefetch else "")
+                                    chunk_tail_skip=args.chunk_tail_skip,
+                                    rtc=args.rtc, inference_freq=args.inference_freq)
+    if args.rtc:
+        mode_desc = "RTC (real-time chunking, continuous async + prefix inpainting)"
+    elif args.async_prefetch:
+        mode_desc = f"async-prefetch, reanchor={args.reanchor}"
+    else:
+        mode_desc = "sync receding-horizon (YAM-aligned)"
+    logger.info("Policy connected (chunk_size=%d, open_loop_horizon=%d, mode=%s).",
+                args.chunk_size, args.open_loop_horizon, mode_desc)
 
     # ── Safety gate for live motion ───────────────────────────────────────
     if not args.dry_run:
@@ -428,6 +441,8 @@ def main() -> None:
     tq_base = {"left": None, "right": None}   # per-arm joint-torque EMA baseline (free motion)
     force_trips = 0
     force_quiet = False   # once a trip fires, stop the per-iteration [force] spam
+    prev_fetch_count = broker.fetch_count   # detect replans to time the execution (open-loop) phase
+    prev_infer_end_t = start_t              # wall-clock when the last inference finished
 
     try:
         while time.monotonic() - start_t < args.duration_s:
@@ -467,7 +482,20 @@ def main() -> None:
 
             t0 = time.monotonic()
             action = broker.get_action(obs_fn)   # (14,) float32
-            infer_ms = (time.monotonic() - t0) * 1000.0
+            block_ms = (time.monotonic() - t0) * 1000.0   # broker round-trip (~0 on cached ticks)
+            serve_ms = broker.last_server_infer_ms        # TRUE server forward-pass time, or None
+
+            # ── Replan timing: inference (model) + execution (open-loop playback of prev chunk) ──
+            # A replan = the broker produced a fresh plan (fetch_count bumped). The execution phase
+            # is the wall-clock between the previous inference finishing and this one starting; the
+            # inference phase is the server forward-pass time.
+            if broker.fetch_count != prev_fetch_count:
+                prev_fetch_count = broker.fetch_count
+                infer_s = (serve_ms / 1000.0) if serve_ms is not None else (block_ms / 1000.0)
+                exec_s = max(0.0, t0 - prev_infer_end_t)
+                prev_infer_end_t = time.monotonic()   # this inference just finished
+                logger.info("[timing] replan #%d: inference=%.2fs  execution=%.2fs  (cycle %.2fs)",
+                            broker.fetch_count, infer_s, exec_s, infer_s + exec_s)
 
             # ── Force guard: stop current chunk & regenerate if pressing too hard ──
             # Soft trip = HALF the e-stop boundary (2x more sensitive), measured as joint-torque
@@ -548,9 +576,11 @@ def main() -> None:
             elif args.dry_run:
                 if iteration % 10 == 1:
                     logger.info(
-                        "Iter %d DRY: infer=%.0fms jump L=%.1f° R=%.1f° "
+                        "Iter %d DRY: serve_infer=%s block=%.0fms jump L=%.1f° R=%.1f° "
                         "gripL %.2f→%.2f gripR %.2f→%.2f",
-                        iteration, infer_ms,
+                        iteration,
+                        f"{serve_ms:.0f}ms" if serve_ms is not None else "n/a",
+                        block_ms,
                         np.degrees(left_jump_rad), np.degrees(right_jump_rad),
                         left_grip, float(action[6]),
                         right_grip, float(action[13]),
@@ -564,9 +594,11 @@ def main() -> None:
                     _, la_now = left_arm.get_gripper_position()
                     _, ra_now = right_arm.get_gripper_position()
                     logger.info(
-                        "Iter %d LIVE: infer=%.0fms jump L=%.1f° R=%.1f° | "
+                        "Iter %d LIVE: serve_infer=%s block=%.0fms jump L=%.1f° R=%.1f° | "
                         "gripL act=%s pred=%.1f cmd=%d  gripR act=%s pred=%.1f cmd=%d",
-                        iteration, infer_ms,
+                        iteration,
+                        f"{serve_ms:.0f}ms" if serve_ms is not None else "n/a",
+                        block_ms,
                         np.degrees(left_jump_rad), np.degrees(right_jump_rad),
                         la_now, float(action[6]),  int(_grip_command(float(action[6]))  * 10.0),
                         ra_now, float(action[13]), int(_grip_command(float(action[13])) * 10.0),
